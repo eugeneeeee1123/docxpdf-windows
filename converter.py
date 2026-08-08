@@ -448,7 +448,10 @@ def _flate_image_object(image: Any, writer: Any) -> Any:
             NameObject("/Height"): NumberObject(color.height),
             NameObject("/ColorSpace"): NameObject(color_space),
             NameObject("/BitsPerComponent"): NumberObject(8),
-            NameObject("/Interpolate"): BooleanObject(True),
+            # Keep viewer-side scaling crisp. The source pixels are already restored
+            # at their native resolution, so requesting interpolation can make text
+            # and screenshots look slightly blurred at common zoom levels.
+            NameObject("/Interpolate"): BooleanObject(False),
         }
     )
     color.close()

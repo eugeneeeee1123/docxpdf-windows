@@ -269,11 +269,15 @@ class ConverterTests(unittest.TestCase):
             report = converter.restore_original_images(source_docx, exported_pdf)
 
             after_reader = PdfReader(str(exported_pdf))
-            restored = after_reader.pages[0].images[0].image.convert("RGB")
+            restored_item = after_reader.pages[0].images[0]
+            restored = restored_item.image.convert("RGB")
             self.assertEqual(report.images_examined, 1)
             self.assertEqual(report.images_restored, 1)
             self.assertEqual(restored.size, original.size)
             self.assertIsNone(ImageChops.difference(original, restored).getbbox())
+            self.assertFalse(
+                restored_item.indirect_reference.get_object()["/Interpolate"].value
+            )
             self.assertEqual(after_reader.pages[0].get_contents().get_data(), before_content)
             self.assertEqual(tuple(after_reader.pages[0].mediabox), before_box)
 

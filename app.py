@@ -43,7 +43,7 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 class DropPanel(QFrame):
