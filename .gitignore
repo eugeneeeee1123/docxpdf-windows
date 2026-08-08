@@ -1,0 +1,23 @@
+# Python environments and interpreter artifacts
+.venv/
+__pycache__/
+*.py[cod]
+
+# IDE and local settings
+.idea/
+.vscode/
+*.user
+
+# PyInstaller and release output
+build/
+dist/
+dist-*/
+*.spec
+
+# Local conversion output and diagnostics
+*.pdf
+qa/
+
+# OS files
+.DS_Store
+Thumbs.db
