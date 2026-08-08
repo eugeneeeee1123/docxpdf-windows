@@ -1,5 +1,9 @@
 # DocxPDF Fidelity Converter for Windows
 
+## Download the packaged app
+
+Download the latest `DocxPDF-Windows-x64.zip` from [GitHub Releases](https://github.com/eugeneeeee1123/docxpdf-windows/releases). Extract it and run `DocxPDF\DocxPDF.exe`. Python is not required for the packaged app, but Microsoft Word must be installed and activated.
+
 English | [简体中文](README.md)
 
 DocxPDF is a local desktop app that uses an installed copy of Microsoft Word to convert one or more DOCX files to PDF. It can also merge the converted documents in list order. Source documents and converted files are never uploaded.
