@@ -43,7 +43,7 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 
 class DropPanel(QFrame):
@@ -309,6 +309,8 @@ class MainWindow(QMainWindow):
         self.language_combo.setObjectName("languageCombo")
         self.language_combo.addItem("中文", "zh")
         self.language_combo.addItem("English", "en")
+        language_popup = self.language_combo.view()
+        language_popup.setObjectName("languagePopup")
         self.language_combo.setMinimumWidth(104)
         language_index = self.language_combo.findData(self.language)
         self.language_combo.setCurrentIndex(max(0, language_index))
@@ -901,6 +903,32 @@ QComboBox#languageCombo {
 }
 QComboBox#languageCombo:hover { border-color: #94a3b8; }
 QComboBox#languageCombo:focus { border: 2px solid #2563eb; }
+QComboBox#languageCombo QAbstractItemView,
+QAbstractItemView#languagePopup {
+    color: #111827;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    selection-background-color: #dbeafe;
+    selection-color: #111827;
+    outline: 0;
+}
+QComboBox#languageCombo QAbstractItemView::item,
+QAbstractItemView#languagePopup::item {
+    color: #111827;
+    background: #ffffff;
+    padding: 7px 10px;
+    min-height: 24px;
+}
+QComboBox#languageCombo QAbstractItemView::item:hover,
+QAbstractItemView#languagePopup::item:hover {
+    color: #111827;
+    background: #eff6ff;
+}
+QComboBox#languageCombo QAbstractItemView::item:selected,
+QAbstractItemView#languagePopup::item:selected {
+    color: #111827;
+    background: #dbeafe;
+}
 QListWidget#fileList:focus, QLineEdit:focus {
     border: 2px solid #2563eb;
 }

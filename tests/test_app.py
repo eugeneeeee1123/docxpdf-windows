@@ -76,6 +76,9 @@ class AppTests(unittest.TestCase):
             with patch.object(app, "QSettings", return_value=settings):
                 with patch.object(app, "locate_word_app", return_value=None):
                     window = app.MainWindow(language="zh")
+                    self.assertEqual(window.language_combo.view().objectName(), "languagePopup")
+                    self.assertEqual(window.language_combo.itemText(0), "中文")
+                    self.assertEqual(window.language_combo.itemText(1), "English")
                     window.add_files([source])
                     self.assertEqual(window.title_label.text(), "DOCX → PDF，保持原始版式")
                     self.assertIn("等待", window.file_list.item(0).text())
