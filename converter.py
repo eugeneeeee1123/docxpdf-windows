@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import errno
 import os
 import platform
 import shutil
@@ -232,6 +233,23 @@ def _wait_for_pdf(path: Path, timeout: float = 8.0) -> bool:
         previous_size = size
         time.sleep(0.1)
     return path.is_file()
+
+
+def _replace_with_retry(source: Path, destination: Path, *, timeout: float = 6.0) -> None:
+    """Atomically replace a PDF, tolerating brief sync-client file locks."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    delay = 0.08
+    retryable_errors = {errno.EACCES, errno.EPERM, 32}
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            error_code = exc.winerror if getattr(exc, "winerror", None) else exc.errno
+            if error_code not in retryable_errors or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(delay, max(0.01, deadline - time.monotonic())))
+            delay = min(delay * 2, 0.8)
 
 
 def _load_com_modules(language: str = DEFAULT_LANGUAGE) -> tuple[ModuleType, Any]:
@@ -532,7 +550,7 @@ def restore_original_images(
                 close()
             writer = None
             _check_pdf(stage, language=language)
-            os.replace(stage, pdf_path)
+            _replace_with_retry(stage, pdf_path)
     except ConversionError:
         raise
     except Exception as exc:
@@ -757,7 +775,7 @@ class WordSession:
                 language=self.language,
             )
             size = _check_pdf(temporary_output, language=self.language)
-            os.replace(temporary_output, output_path)
+            _replace_with_retry(temporary_output, output_path)
         except ConversionError:
             raise
         except OSError as exc:
@@ -842,7 +860,7 @@ def merge_pdfs(
         with temporary_output.open("wb") as stream:
             writer.write(stream)
         size = _check_pdf(temporary_output, language=language)
-        os.replace(temporary_output, output_path)
+        _replace_with_retry(temporary_output, output_path)
     except ConversionError:
         raise
     except Exception as exc:

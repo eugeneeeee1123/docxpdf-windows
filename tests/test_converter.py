@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 import unittest
@@ -91,6 +92,17 @@ class FakeClient:
 
 
 class ConverterTests(unittest.TestCase):
+    def test_replace_with_retry_handles_transient_access_denied(self) -> None:
+        source = Path("source.pdf")
+        destination = Path("destination.pdf")
+        denied = PermissionError(errno.EACCES, "Access is denied")
+        with patch.object(converter.os, "replace", side_effect=[denied, None]) as replace:
+            with patch.object(converter.time, "sleep") as sleep:
+                converter._replace_with_retry(source, destination, timeout=1)
+
+        self.assertEqual(replace.call_count, 2)
+        sleep.assert_called_once()
+
     def test_next_output_path_is_non_destructive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
