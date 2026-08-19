@@ -32,6 +32,14 @@ STRINGS: dict[str, dict[str, str]] = {
     "file_list_accessible": {"zh": "待转换 DOCX 文件列表", "en": "DOCX files to convert"},
     "output_section": {"zh": "输出位置", "en": "Output location"},
     "output_placeholder": {"zh": "请选择保存 PDF 的文件夹", "en": "Choose a folder for the PDFs"},
+    "output_path_preview": {
+        "zh": "当前文件夹：{path}",
+        "en": "Current folder: {path}",
+    },
+    "output_path_empty": {
+        "zh": "选中文件后会自动使用原文件所在文件夹",
+        "en": "After you choose files, their folder will be used automatically",
+    },
     "output_accessible": {"zh": "PDF 输出文件夹", "en": "PDF output folder"},
     "browse": {"zh": "浏览…", "en": "Browse…"},
     "browse_tooltip": {"zh": "选择 PDF 保存位置", "en": "Choose where to save the PDFs"},

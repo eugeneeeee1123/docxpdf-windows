@@ -43,7 +43,7 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 # Word can become unstable after a long sequence of COM exports even when each
 # document is closed correctly. Keep batches bounded so one large folder cannot
 # poison the rest of the conversion job.
@@ -394,13 +394,24 @@ class MainWindow(QMainWindow):
         output_row = QHBoxLayout()
         output_row.setSpacing(10)
         self.output_edit = QLineEdit()
+        self.output_edit.setClearButtonEnabled(True)
         self.output_edit.textChanged.connect(self._refresh_actions)
+        self.output_edit.textChanged.connect(self._update_output_path_preview)
         output_row.addWidget(self.output_edit, 1)
         self.output_button = QPushButton()
         self.output_button.setObjectName("secondaryButton")
         self.output_button.clicked.connect(self.choose_output_dir)
         output_row.addWidget(self.output_button)
         layout.addLayout(output_row)
+
+        self.output_path_preview = QLabel()
+        self.output_path_preview.setObjectName("pathPreview")
+        self.output_path_preview.setWordWrap(True)
+        self.output_path_preview.setTextFormat(Qt.TextFormat.PlainText)
+        self.output_path_preview.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.output_path_preview)
 
         option_row = QHBoxLayout()
         self.overwrite_box = QCheckBox()
@@ -493,6 +504,7 @@ class MainWindow(QMainWindow):
         self.output_title_label.setText(self._t("output_section"))
         self.output_edit.setPlaceholderText(self._t("output_placeholder"))
         self.output_edit.setAccessibleName(self._t("output_accessible"))
+        self._update_output_path_preview()
         self.output_button.setText(self._t("browse"))
         self.output_button.setToolTip(self._t("browse_tooltip"))
         self.overwrite_box.setText(self._t("overwrite"))
@@ -558,6 +570,26 @@ class MainWindow(QMainWindow):
             self.cancel_button.setVisible(not enabled)
             self.cancel_button.setEnabled(not enabled)
 
+    def _update_output_path_preview(self) -> None:
+        path = self.output_edit.text().strip()
+        has_path = bool(path)
+        if has_path:
+            self.output_path_preview.setText(
+                self._t("output_path_preview", path=path)
+            )
+            self.output_edit.setToolTip(path)
+        else:
+            self.output_path_preview.setText(self._t("output_path_empty"))
+            self.output_edit.setToolTip(self._t("output_placeholder"))
+        self.output_path_preview.setProperty("hasPath", has_path)
+        self.output_path_preview.style().unpolish(self.output_path_preview)
+        self.output_path_preview.style().polish(self.output_path_preview)
+
+    def _set_output_path(self, path: str) -> None:
+        """Set a chosen/default path and reveal its beginning immediately."""
+        self.output_edit.setText(path)
+        self.output_edit.setCursorPosition(0)
+
     @pyqtSlot()
     def choose_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -594,7 +626,7 @@ class MainWindow(QMainWindow):
             added += 1
 
         if self.sources and not self.output_edit.text().strip():
-            self.output_edit.setText(str(self.sources[0].parent))
+            self._set_output_path(str(self.sources[0].parent))
         self.count_label.setText(self._t("file_count", count=len(self.sources)))
         if added:
             if skipped:
@@ -639,7 +671,7 @@ class MainWindow(QMainWindow):
             initial,
         )
         if selected:
-            self.output_edit.setText(str(Path(selected).resolve()))
+            self._set_output_path(str(Path(selected).resolve()))
 
     def _set_item_status(self, source: str | Path, state: str, **values) -> None:
         key = str(Path(source))
@@ -884,6 +916,17 @@ QLabel#title {
 QLabel#subtitle, QLabel#muted, QLabel#statusLabel {
     color: #64748b;
     font-size: 13px;
+}
+QLabel#pathPreview {
+    color: #334155;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+QLabel#pathPreview[hasPath="false"] {
+    color: #64748b;
 }
 QLabel#sectionTitle {
     color: #111827;

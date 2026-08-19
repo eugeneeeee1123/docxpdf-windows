@@ -134,6 +134,11 @@ class AppTests(unittest.TestCase):
                     window.add_files([source])
                     self.assertEqual(window.title_label.text(), "DOCX → PDF，保持原始版式")
                     self.assertIn("等待", window.file_list.item(0).text())
+                    output_path = str(source.resolve().parent)
+                    self.assertEqual(window.output_edit.text(), output_path)
+                    self.assertEqual(window.output_edit.cursorPosition(), 0)
+                    self.assertIn(output_path, window.output_path_preview.text())
+                    self.assertEqual(window.output_edit.toolTip(), output_path)
                     window.on_file_succeeded(
                         ConversionResult(
                             source=source.resolve(),
@@ -158,6 +163,7 @@ class AppTests(unittest.TestCase):
                     self.assertIn("2 original image(s) restored", window.file_list.item(0).text())
                     self.assertIn("2 original image(s) restored", window.status_label.text())
                     self.assertEqual(window.output_button.text(), "Browse…")
+                    self.assertIn("Current folder:", window.output_path_preview.text())
                     settings.setValue.assert_called_with("ui/language", "en")
                     window.close()
 
