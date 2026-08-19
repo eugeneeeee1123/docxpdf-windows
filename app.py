@@ -43,7 +43,11 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
+# Word can become unstable after a long sequence of COM exports even when each
+# document is closed correctly. Keep batches bounded so one large folder cannot
+# poison the rest of the conversion job.
+WORD_SESSION_DOCUMENT_LIMIT = 32
 
 
 class DropPanel(QFrame):
@@ -175,46 +179,67 @@ class ConversionWorker(QObject):
                 return
 
         try:
-            with WordSession(language=self.language) as word_session:
-                for index, source in enumerate(self.sources, start=1):
-                    if self.cancel_requested:
-                        cancelled = True
-                        break
-                    self.file_started.emit(str(source), index, total)
-                    try:
-                        if self.merge:
-                            output = Path(temporary_dir.name) / f"part-{index:04d}.pdf"
-                        else:
-                            output = next_output_path(
+            source_index = 0
+            stop_batch = False
+            while source_index < total and not stop_batch and not self.cancel_requested:
+                # Rotate the isolated Word process periodically. This is
+                # especially important for large folders in OneDrive, where a
+                # long-lived Word COM server can eventually return "Command
+                # failed" for every subsequent document.
+                with WordSession(language=self.language) as word_session:
+                    documents_in_session = 0
+                    while (
+                        source_index < total
+                        and documents_in_session < WORD_SESSION_DOCUMENT_LIMIT
+                        and not self.cancel_requested
+                    ):
+                        source = self.sources[source_index]
+                        index = source_index + 1
+                        source_index += 1
+                        self.file_started.emit(str(source), index, total)
+                        try:
+                            if self.merge:
+                                output = Path(temporary_dir.name) / f"part-{index:04d}.pdf"
+                            else:
+                                output = next_output_path(
+                                    source,
+                                    self.output_dir,
+                                    self.overwrite,
+                                    language=self.language,
+                                )
+                            result = word_session.convert_docx(
                                 source,
-                                self.output_dir,
-                                self.overwrite,
-                                language=self.language,
+                                output,
+                                overwrite=True if self.merge else self.overwrite,
+                                timeout=300,
                             )
-                        result = word_session.convert_docx(
-                            source,
-                            output,
-                            overwrite=True if self.merge else self.overwrite,
-                            timeout=300,
-                        )
-                    except ConversionError as exc:
-                        message = str(exc)
-                        errors.append((source, message))
-                        self.file_failed.emit(str(source), message, index, total)
-                        if exc.abort_batch:
+                        except ConversionError as exc:
+                            message = str(exc)
+                            errors.append((source, message))
+                            self.file_failed.emit(str(source), message, index, total)
+                            if exc.abort_batch:
+                                stop_batch = True
+                            # A non-fatal Word export error can still leave the
+                            # COM server poisoned. End this session before the
+                            # next file instead of cascading the same failure.
                             break
-                    except Exception as exc:  # Defensive boundary for a GUI worker.
-                        message = tr(self.language, "unexpected_error", error=exc)
-                        errors.append((source, message))
-                        self.file_failed.emit(str(source), message, index, total)
-                    else:
-                        results.append(result)
-                        if self.merge:
-                            temporary_pdfs.append(result.output)
-                        self.file_succeeded.emit(result, index, total)
+                        except Exception as exc:  # Defensive boundary for a GUI worker.
+                            message = tr(self.language, "unexpected_error", error=exc)
+                            errors.append((source, message))
+                            self.file_failed.emit(str(source), message, index, total)
+                            break
+                        else:
+                            results.append(result)
+                            if self.merge:
+                                temporary_pdfs.append(result.output)
+                            self.file_succeeded.emit(result, index, total)
+                            documents_in_session += 1
 
                 if self.cancel_requested:
                     cancelled = True
+
+            if self.cancel_requested:
+                cancelled = True
 
             merged_result = None
             if self.merge and not errors and not cancelled:

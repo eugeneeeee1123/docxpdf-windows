@@ -66,6 +66,58 @@ class AppTests(unittest.TestCase):
             session.convert_docx.assert_not_called()
             self.assertTrue(finished_payloads[-1][3])
 
+    def test_nonfatal_word_failure_restarts_session_before_next_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sources = [folder / "one.docx", folder / "two.docx"]
+            first_session = MagicMock()
+            first_session.__enter__.return_value = first_session
+            first_session.__exit__.return_value = None
+            first_session.convert_docx.side_effect = app.ConversionError(
+                "Microsoft Word 导出失败：Command failed"
+            )
+            second_session = MagicMock()
+            second_session.__enter__.return_value = second_session
+            second_session.__exit__.return_value = None
+            second_session.convert_docx.return_value = ConversionResult(
+                sources[1].resolve(), folder / "two.pdf", 10, 0.1
+            )
+
+            worker = app.ConversionWorker(sources, folder, False, False)
+            with patch.object(
+                app,
+                "WordSession",
+                side_effect=[first_session, second_session],
+            ) as session_factory:
+                worker.run()
+
+            self.assertEqual(session_factory.call_count, 2)
+            first_session.convert_docx.assert_called_once()
+            second_session.convert_docx.assert_called_once()
+            first_session.__exit__.assert_called_once()
+            second_session.__exit__.assert_called_once()
+
+    def test_long_batch_rotates_word_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sources = [folder / f"file-{index:02d}.docx" for index in range(33)]
+            sessions = []
+            for source in sources:
+                session = MagicMock()
+                session.__enter__.return_value = session
+                session.__exit__.return_value = None
+                session.convert_docx.return_value = ConversionResult(
+                    source.resolve(), folder / f"{source.stem}.pdf", 10, 0.1
+                )
+                sessions.append(session)
+
+            worker = app.ConversionWorker(sources, folder, False, False)
+            with patch.object(app, "WordSession", side_effect=sessions) as session_factory:
+                worker.run()
+
+            self.assertEqual(session_factory.call_count, 2)
+            self.assertEqual(sum(s.convert_docx.call_count for s in sessions), 33)
+
     def test_language_switch_retranslates_controls_and_file_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "sample.docx"
