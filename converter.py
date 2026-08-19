@@ -8,6 +8,7 @@ import platform
 import shutil
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -67,6 +68,7 @@ class _DocxImage:
     name: str
     image: Any
     digest: str
+    comparison_sample: Any
 
 
 def _candidate_from_override(raw: str) -> Path | None:
@@ -177,16 +179,21 @@ def next_output_path(
     overwrite: bool = False,
     *,
     language: str = DEFAULT_LANGUAGE,
+    reserved_paths: Iterable[str | Path] | None = None,
 ) -> Path:
     source_path = Path(source)
     folder = Path(output_dir).expanduser()
+    reserved = {
+        Path(path).expanduser().resolve()
+        for path in (reserved_paths or ())
+    }
     target = folder / f"{source_path.stem}.pdf"
-    if overwrite or not target.exists():
+    if (overwrite or not target.exists()) and target.resolve() not in reserved:
         return target
 
     for number in range(1, 10_000):
         candidate = folder / f"{source_path.stem}-{number}.pdf"
-        if not candidate.exists():
+        if not candidate.exists() and candidate.resolve() not in reserved:
             return candidate
     raise ConversionError(tr(language, "too_many_names", path=folder))
 
@@ -319,12 +326,46 @@ def _friendly_com_error(
     return ConversionError(tr(language, "word_export_failed", detail=detail))
 
 
+COMPARISON_SAMPLE_SIZE = (64, 64)
+IMAGE_MATCH_THRESHOLD = 0.985
+IMAGE_MATCH_AMBIGUITY_MARGIN = 0.002
+
+
 def _flatten_for_comparison(image: Any, image_module: Any) -> Any:
     if "A" in image.getbands() or "transparency" in image.info:
         rgba = image.convert("RGBA")
         background = image_module.new("RGBA", rgba.size, (255, 255, 255, 255))
-        return image_module.alpha_composite(background, rgba).convert("RGB")
+        try:
+            return image_module.alpha_composite(background, rgba).convert("RGB")
+        finally:
+            rgba.close()
+            background.close()
     return image.convert("RGB")
+
+
+def _comparison_sample(image: Any, image_module: Any) -> Any:
+    flattened = _flatten_for_comparison(image, image_module)
+    try:
+        return flattened.resize(COMPARISON_SAMPLE_SIZE, image_module.Resampling.LANCZOS)
+    finally:
+        flattened.close()
+
+
+def _sample_similarity(
+    source_sample: Any,
+    exported_sample: Any,
+    image_chops: Any,
+    image_stat: Any,
+) -> float:
+    difference = None
+    try:
+        difference = image_chops.difference(source_sample, exported_sample)
+        rms = image_stat.Stat(difference).rms
+        normalized = (sum(value * value for value in rms) / len(rms)) ** 0.5 / 255.0
+        return max(0.0, 1.0 - normalized)
+    finally:
+        if difference is not None:
+            difference.close()
 
 
 def _load_docx_images(
@@ -357,10 +398,34 @@ def _load_docx_images(
                 if image.mode in {"I", "F", "I;16", "I;16B", "I;16L"}:
                     image.close()
                     continue
-                flattened = _flatten_for_comparison(image, Image)
-                digest = hashlib.sha256(flattened.tobytes()).hexdigest()
-                flattened.close()
-                candidates.append(_DocxImage(name=name, image=image, digest=digest))
+                flattened = None
+                comparison_sample = None
+                try:
+                    flattened = _flatten_for_comparison(image, Image)
+                    digest = hashlib.sha256(
+                        f"{flattened.width}x{flattened.height}:".encode("ascii")
+                        + flattened.tobytes()
+                    ).hexdigest()
+                    comparison_sample = flattened.resize(
+                        COMPARISON_SAMPLE_SIZE,
+                        Image.Resampling.LANCZOS,
+                    )
+                except Exception:
+                    if comparison_sample is not None:
+                        comparison_sample.close()
+                    image.close()
+                    continue
+                finally:
+                    if flattened is not None:
+                        flattened.close()
+                candidates.append(
+                    _DocxImage(
+                        name=name,
+                        image=image,
+                        digest=digest,
+                        comparison_sample=comparison_sample,
+                    )
+                )
     except (BadZipFile, KeyError, OSError):
         return []
     return candidates
@@ -386,18 +451,15 @@ def _visual_similarity(
     if abs(source_ratio - exported_ratio) / max(source_ratio, exported_ratio) > 0.01:
         return -1.0
 
-    sample_size = (64, 64)
-    source_sample = _flatten_for_comparison(source_image, Image).resize(
-        sample_size, Image.Resampling.LANCZOS
-    )
-    exported_sample = _flatten_for_comparison(exported_image, Image).resize(
-        sample_size, Image.Resampling.LANCZOS
-    )
+    source_sample = _comparison_sample(source_image, Image)
+    exported_sample = _comparison_sample(exported_image, Image)
     try:
-        difference = ImageChops.difference(source_sample, exported_sample)
-        rms = ImageStat.Stat(difference).rms
-        normalized = (sum(value * value for value in rms) / len(rms)) ** 0.5 / 255.0
-        return max(0.0, 1.0 - normalized)
+        return _sample_similarity(
+            source_sample,
+            exported_sample,
+            ImageChops,
+            ImageStat,
+        )
     finally:
         source_sample.close()
         exported_sample.close()
@@ -409,30 +471,53 @@ def _best_source_image(
     *,
     language: str = DEFAULT_LANGUAGE,
 ) -> _DocxImage | None:
-    scored = sorted(
-        (
-            (
-                _visual_similarity(
-                    candidate.image,
-                    exported_image,
-                    language=language,
-                ),
-                candidate,
+    try:
+        from PIL import Image, ImageChops, ImageStat
+    except ImportError as exc:
+        raise ConversionError(tr(language, "pillow_restore_required")) from exc
+
+    if not exported_image.width or not exported_image.height:
+        return None
+    exported_ratio = exported_image.width / exported_image.height
+    exported_sample = _comparison_sample(exported_image, Image)
+    best_score = -1.0
+    second_score = -1.0
+    best_candidate: _DocxImage | None = None
+    second_candidate: _DocxImage | None = None
+    try:
+        for candidate in candidates:
+            candidate_ratio = candidate.image.width / candidate.image.height
+            if abs(candidate_ratio - exported_ratio) / max(
+                candidate_ratio,
+                exported_ratio,
+            ) > 0.01:
+                continue
+            score = _sample_similarity(
+                candidate.comparison_sample,
+                exported_sample,
+                ImageChops,
+                ImageStat,
             )
-            for candidate in candidates
-        ),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    if not scored or scored[0][0] < 0.985:
+            if score > best_score:
+                second_score = best_score
+                second_candidate = best_candidate
+                best_score = score
+                best_candidate = candidate
+            elif score > second_score:
+                second_score = score
+                second_candidate = candidate
+    finally:
+        exported_sample.close()
+
+    if best_candidate is None or best_score < IMAGE_MATCH_THRESHOLD:
         return None
     if (
-        len(scored) > 1
-        and scored[0][0] - scored[1][0] < 0.002
-        and scored[0][1].digest != scored[1][1].digest
+        second_candidate is not None
+        and best_score - second_score < IMAGE_MATCH_AMBIGUITY_MARGIN
+        and best_candidate.digest != second_candidate.digest
     ):
         return None
-    return scored[0][1]
+    return best_candidate
 
 
 def _flate_image_object(image: Any, writer: Any) -> Any:
@@ -511,6 +596,7 @@ def restore_original_images(
     except ImportError as exc:
         for candidate in candidates:
             candidate.image.close()
+            candidate.comparison_sample.close()
         raise ConversionError(tr(language, "pypdf_restore_required")) from exc
 
     writer = None
@@ -563,6 +649,7 @@ def restore_original_images(
                 close()
         for candidate in candidates:
             candidate.image.close()
+            candidate.comparison_sample.close()
 
     return ImageRestorationReport(
         images_examined=images_examined,

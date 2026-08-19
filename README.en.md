@@ -16,6 +16,7 @@ DocxPDF is a local desktop app that uses an installed copy of Microsoft Word to 
 - Choose a custom output folder
 - Protect existing files by adding `-1`, `-2`, and so on unless overwrite is enabled
 - Background processing, per-file states, cancellation after the current file, and File Explorer reveal
+- Up to two isolated Word sessions process batch files in parallel by default, while list and merge order remain stable
 - Unicode, spaces, and long filenames supported
 - Instant 中文/English switching; follows the Windows language on first launch and remembers the user's choice
 
@@ -48,7 +49,9 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The 15 tests cover both interface languages and translation completeness, Word COM arguments and cleanup, atomic output, failures and cancellation, original-pixel restoration, merge order, and preservation of image streams during merge.
+The test suite covers both interface languages and translation completeness, Word COM arguments and cleanup, atomic output, failures and cancellation, parallel batch scheduling, original-pixel restoration, merge order, and preservation of image streams during merge.
+
+Batch conversion uses two parallel Word sessions by default. If a machine is short on memory or Word automation is unstable, set `DOCXPDF_WORD_WORKERS=1` before starting the app; values from `2` to `4` can be used to increase parallelism.
 
 ## Build the Windows app
 

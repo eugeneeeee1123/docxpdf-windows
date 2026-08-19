@@ -3,7 +3,11 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Event, Lock
+from typing import Any
 
 from PyQt6.QtCore import QLocale, QObject, QSettings, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QCloseEvent, QFont, QFontDatabase, QMouseEvent
@@ -48,6 +52,12 @@ APP_VERSION = "1.0.5"
 # document is closed correctly. Keep batches bounded so one large folder cannot
 # poison the rest of the conversion job.
 WORD_SESSION_DOCUMENT_LIMIT = 32
+# A Word COM instance is expensive and can become unstable when too many
+# instances are automated at once. Two isolated sessions give batch jobs real
+# overlap while keeping memory and COM pressure predictable. Set
+# DOCXPDF_WORD_WORKERS=1..4 when troubleshooting a particular machine.
+DEFAULT_PARALLEL_WORD_WORKERS = 2
+MAX_PARALLEL_WORD_WORKERS = 4
 
 
 class DropPanel(QFrame):
@@ -134,6 +144,8 @@ class ConversionWorker(QObject):
         overwrite: bool,
         merge: bool,
         language: str = DEFAULT_LANGUAGE,
+        *,
+        parallel_workers: int | None = None,
     ) -> None:
         super().__init__()
         self.sources = sources
@@ -142,19 +154,174 @@ class ConversionWorker(QObject):
         self.merge = merge
         self.language = normalize_language(language)
         self.cancel_requested = False
+        self.parallel_workers = parallel_workers
+        self._cancel_event = Event()
+        self._stop_event = Event()
 
     def request_cancel(self) -> None:
         """Stop after the current Word export returns."""
         self.cancel_requested = True
+        self._cancel_event.set()
+
+    def _worker_count(self, total: int) -> int:
+        if total < 2:
+            return 1
+        configured = self.parallel_workers
+        if configured is None:
+            raw = os.environ.get("DOCXPDF_WORD_WORKERS", "").strip()
+            if raw:
+                try:
+                    configured = int(raw)
+                except ValueError:
+                    configured = DEFAULT_PARALLEL_WORD_WORKERS
+            else:
+                configured = DEFAULT_PARALLEL_WORD_WORKERS
+        return max(1, min(MAX_PARALLEL_WORD_WORKERS, int(configured), total))
+
+    @staticmethod
+    def _close_session(session_context: Any | None, entered: bool) -> None:
+        if session_context is None or not entered:
+            return
+        try:
+            session_context.__exit__(None, None, None)
+        except Exception:
+            # The conversion result/error is more useful than a cleanup error;
+            # WordSession itself already makes cleanup best-effort.
+            pass
+
+    def _record_task_error(
+        self,
+        errors: list[tuple[Path, str]],
+        lock: Lock,
+        path: Path,
+        message: str,
+    ) -> None:
+        with lock:
+            # A startup failure can be observed by more than one lane. Keep a
+            # single batch-level error instead of showing duplicate messages.
+            if not errors:
+                errors.append((path, message))
+
+    def _run_conversion_lane(
+        self,
+        work_queue: Queue[int],
+        output_paths: dict[int, Path],
+        results: dict[int, ConversionResult],
+        source_errors: dict[int, tuple[Path, str]],
+        task_errors: list[tuple[Path, str]],
+        state_lock: Lock,
+        total: int,
+    ) -> None:
+        """Convert a dynamic slice of files on one COM-initialized thread.
+
+        Each lane owns its WordSession from start to finish. No COM object is
+        shared between Python threads; only plain paths and result records cross
+        the lane boundary.
+        """
+        session_context: Any | None = None
+        session: Any | None = None
+        session_entered = False
+        documents_in_session = 0
+
+        def close_session() -> None:
+            nonlocal session_context, session, session_entered, documents_in_session
+            self._close_session(session_context, session_entered)
+            session_context = None
+            session = None
+            session_entered = False
+            documents_in_session = 0
+
+        def start_session() -> None:
+            nonlocal session_context, session, session_entered, documents_in_session
+            session_context = WordSession(language=self.language)
+            try:
+                session = session_context.__enter__()
+                session_entered = True
+                documents_in_session = 0
+            except Exception:
+                session_context = None
+                session = None
+                session_entered = False
+                raise
+
+        try:
+            while not self._cancel_event.is_set() and not self._stop_event.is_set():
+                try:
+                    index = work_queue.get_nowait()
+                except Empty:
+                    break
+
+                try:
+                    if self._cancel_event.is_set() or self._stop_event.is_set():
+                        continue
+                    if session is None or documents_in_session >= WORD_SESSION_DOCUMENT_LIMIT:
+                        close_session()
+                        try:
+                            start_session()
+                        except ConversionError as exc:
+                            self._record_task_error(
+                                task_errors,
+                                state_lock,
+                                Path(tr(self.language, "word_label")),
+                                str(exc),
+                            )
+                            self._stop_event.set()
+                            continue
+                        except Exception as exc:
+                            self._record_task_error(
+                                task_errors,
+                                state_lock,
+                                Path(tr(self.language, "task_label")),
+                                tr(self.language, "unexpected_error", error=exc),
+                            )
+                            self._stop_event.set()
+                            continue
+
+                    source = self.sources[index - 1]
+                    self.file_started.emit(str(source), index, total)
+                    output = output_paths[index]
+                    try:
+                        result = session.convert_docx(
+                            source,
+                            output,
+                            overwrite=True if self.merge else self.overwrite,
+                            timeout=300,
+                        )
+                    except ConversionError as exc:
+                        message = str(exc)
+                        with state_lock:
+                            source_errors[index] = (source, message)
+                        self.file_failed.emit(str(source), message, index, total)
+                        # A failed document can poison the current Word COM
+                        # server. Drop this session before taking more work.
+                        close_session()
+                        if exc.abort_batch:
+                            self._stop_event.set()
+                        continue
+                    except Exception as exc:
+                        message = tr(self.language, "unexpected_error", error=exc)
+                        with state_lock:
+                            source_errors[index] = (source, message)
+                        self.file_failed.emit(str(source), message, index, total)
+                        close_session()
+                        continue
+
+                    with state_lock:
+                        results[index] = result
+                    documents_in_session += 1
+                    self.file_succeeded.emit(result, index, total)
+                finally:
+                    work_queue.task_done()
+        finally:
+            close_session()
 
     @pyqtSlot()
     def run(self) -> None:
         results: list[ConversionResult] = []
         errors: list[tuple[Path, str]] = []
         total = len(self.sources)
-        temporary_pdfs: list[Path] = []
         temporary_dir = None
-        cancelled = False
+        cancelled = self._cancel_event.is_set()
 
         if self.merge:
             import tempfile
@@ -179,72 +346,70 @@ class ConversionWorker(QObject):
                 return
 
         try:
-            source_index = 0
-            stop_batch = False
-            while source_index < total and not stop_batch and not self.cancel_requested:
-                # Rotate the isolated Word process periodically. This is
-                # especially important for large folders in OneDrive, where a
-                # long-lived Word COM server can eventually return "Command
-                # failed" for every subsequent document.
-                with WordSession(language=self.language) as word_session:
-                    documents_in_session = 0
-                    while (
-                        source_index < total
-                        and documents_in_session < WORD_SESSION_DOCUMENT_LIMIT
-                        and not self.cancel_requested
-                    ):
-                        source = self.sources[source_index]
-                        index = source_index + 1
-                        source_index += 1
-                        self.file_started.emit(str(source), index, total)
-                        try:
-                            if self.merge:
-                                output = Path(temporary_dir.name) / f"part-{index:04d}.pdf"
-                            else:
-                                output = next_output_path(
-                                    source,
-                                    self.output_dir,
-                                    self.overwrite,
-                                    language=self.language,
-                                )
-                            result = word_session.convert_docx(
-                                source,
-                                output,
-                                overwrite=True if self.merge else self.overwrite,
-                                timeout=300,
-                            )
-                        except ConversionError as exc:
-                            message = str(exc)
-                            errors.append((source, message))
-                            self.file_failed.emit(str(source), message, index, total)
-                            if exc.abort_batch:
-                                stop_batch = True
-                            # A non-fatal Word export error can still leave the
-                            # COM server poisoned. End this session before the
-                            # next file instead of cascading the same failure.
-                            break
-                        except Exception as exc:  # Defensive boundary for a GUI worker.
-                            message = tr(self.language, "unexpected_error", error=exc)
-                            errors.append((source, message))
-                            self.file_failed.emit(str(source), message, index, total)
-                            break
-                        else:
-                            results.append(result)
-                            if self.merge:
-                                temporary_pdfs.append(result.output)
-                            self.file_succeeded.emit(result, index, total)
-                            documents_in_session += 1
+            output_paths: dict[int, Path] = {}
+            reserved_outputs: set[Path] = set()
+            for index, source in enumerate(self.sources, start=1):
+                if self.merge:
+                    output = Path(temporary_dir.name) / f"part-{index:04d}.pdf"
+                else:
+                    output = next_output_path(
+                        source,
+                        self.output_dir,
+                        self.overwrite,
+                        language=self.language,
+                        reserved_paths=reserved_outputs,
+                    )
+                    reserved_outputs.add(output.resolve())
+                output_paths[index] = output
 
-                if self.cancel_requested:
-                    cancelled = True
+            work_queue: Queue[int] = Queue()
+            for index in range(1, total + 1):
+                work_queue.put(index)
+            results_by_index: dict[int, ConversionResult] = {}
+            source_errors: dict[int, tuple[Path, str]] = {}
+            task_errors: list[tuple[Path, str]] = []
+            state_lock = Lock()
+            self._stop_event.clear()
+            worker_count = self._worker_count(total)
 
-            if self.cancel_requested:
-                cancelled = True
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="DocxPDF-Word",
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self._run_conversion_lane,
+                        work_queue,
+                        output_paths,
+                        results_by_index,
+                        source_errors,
+                        task_errors,
+                        state_lock,
+                        total,
+                    )
+                    for _ in range(worker_count)
+                ]
+                for future in futures:
+                    future.result()
+
+            results = [
+                results_by_index[index]
+                for index in range(1, total + 1)
+                if index in results_by_index
+            ]
+            errors = [
+                source_errors[index]
+                for index in range(1, total + 1)
+                if index in source_errors
+            ]
+            errors.extend(task_errors)
+            cancelled = self._cancel_event.is_set()
 
             merged_result = None
             if self.merge and not errors and not cancelled:
                 self.merge_started.emit()
                 try:
+                    temporary_pdfs = [result.output for result in results]
                     merged_result = merge_pdfs(
                         temporary_pdfs,
                         next_merge_path(
@@ -306,6 +471,7 @@ class MainWindow(QMainWindow):
         self.running = False
         self.job_merge = False
         self.close_after_cancel = False
+        self._completed_files = 0
         self._status_key = "select_files"
         self._status_values: dict[str, object] = {}
 
@@ -727,6 +893,7 @@ class MainWindow(QMainWindow):
         self.job_merge = merge
         self.progress.setRange(0, len(self.sources) + (1 if merge else 0))
         self.progress.setValue(0)
+        self._completed_files = 0
         self._set_status("starting_word" if not merge else "starting_merge")
         for source in self.sources:
             self._set_item_status(source, "waiting")
@@ -781,7 +948,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self._set_item_status(result.source, "complete")
-        self.progress.setValue(index)
+        self._completed_files += 1
+        self.progress.setValue(self._completed_files)
         size_mb = result.size_bytes / (1024 * 1024)
         self._set_status(
             "file_completed",
@@ -795,7 +963,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, str, int, int)
     def on_file_failed(self, source: str, message: str, index: int, total: int) -> None:
         self._set_item_status(source, "failed")
-        self.progress.setValue(index)
+        self._completed_files += 1
+        self.progress.setValue(self._completed_files)
         self._set_status("file_error", name=Path(source).name, message=message)
 
     @pyqtSlot()

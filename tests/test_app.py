@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -117,6 +118,64 @@ class AppTests(unittest.TestCase):
 
             self.assertEqual(session_factory.call_count, 2)
             self.assertEqual(sum(s.convert_docx.call_count for s in sessions), 33)
+
+    def test_parallel_lanes_overlap_and_keep_result_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            first = folder / "first" / "same-name.docx"
+            second = folder / "second" / "same-name.docx"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.touch()
+            second.touch()
+            sources = [first, second]
+            barrier = threading.Barrier(2)
+            active = 0
+            max_active = 0
+            active_lock = threading.Lock()
+
+            def convert(source, output, **_kwargs):
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    barrier.wait(timeout=3)
+                finally:
+                    with active_lock:
+                        active -= 1
+                return ConversionResult(source.resolve(), Path(output), 10, 0.1)
+
+            sessions = []
+            for _ in sources:
+                session = MagicMock()
+                session.__enter__.return_value = session
+                session.__exit__.return_value = None
+                session.convert_docx.side_effect = convert
+                sessions.append(session)
+
+            worker = app.ConversionWorker(
+                sources,
+                folder,
+                False,
+                False,
+                parallel_workers=2,
+            )
+            finished_payloads = []
+            worker.finished.connect(lambda *payload: finished_payloads.append(payload))
+            with patch.object(app, "WordSession", side_effect=sessions):
+                worker.run()
+
+            self.assertEqual(max_active, 2)
+            self.assertEqual(
+                [result.source for result in finished_payloads[-1][0]],
+                [source.resolve() for source in sources],
+            )
+            self.assertEqual(
+                [result.output.name for result in finished_payloads[-1][0]],
+                ["same-name.pdf", "same-name-1.pdf"],
+            )
+            self.assertFalse(finished_payloads[-1][1])
 
     def test_language_switch_retranslates_controls_and_file_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
