@@ -255,8 +255,12 @@ class AppTests(unittest.TestCase):
                     self.assertEqual(row.direction(), QBoxLayout.Direction.LeftToRight)
                 self.assertEqual(window.root_layout.contentsMargins().left(), 12)
                 self.assertEqual(window.convert_button.minimumWidth(), 116)
+                self.assertEqual(
+                    window.workspace_layout.direction(),
+                    QBoxLayout.Direction.TopToBottom,
+                )
 
-                window.resize(840, 740)
+                window.resize(1120, 740)
                 window._apply_responsive_layout()
                 for row in (
                     window.header_row,
@@ -266,8 +270,15 @@ class AppTests(unittest.TestCase):
                     window.footer,
                 ):
                     self.assertEqual(row.direction(), QBoxLayout.Direction.LeftToRight)
-                self.assertEqual(window.root_layout.contentsMargins().left(), 38)
+                self.assertEqual(window.root_layout.contentsMargins().left(), 34)
                 self.assertEqual(window.convert_button.minimumWidth(), 144)
+                self.assertEqual(
+                    window.workspace_layout.direction(),
+                    QBoxLayout.Direction.LeftToRight,
+                )
+                self.assertEqual(window.workspace_layout.stretch(0), 3)
+                self.assertEqual(window.workspace_layout.stretch(1), 2)
+                self.assertEqual(window.file_list.minimumHeight(), 220)
 
                 light_index = window.theme_combo.findData("light")
                 window.theme_combo.setCurrentIndex(light_index)

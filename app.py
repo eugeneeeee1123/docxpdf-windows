@@ -50,7 +50,7 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.8"
 # Word can become unstable after a long sequence of COM exports even when each
 # document is closed correctly. Keep batches bounded so one large folder cannot
 # poison the rest of the conversion job.
@@ -555,10 +555,40 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.title_label)
         layout.addWidget(self.subtitle_label)
 
+        self.workspace = QWidget()
+        self.workspace.setObjectName("workspace")
+        self.workspace.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        workspace_layout = QHBoxLayout(self.workspace)
+        self.workspace_layout = workspace_layout
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(16)
+
+        self.files_column = QWidget()
+        self.files_column.setObjectName("filesColumn")
+        self.files_column.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        files_column_layout = QVBoxLayout(self.files_column)
+        self.files_column_layout = files_column_layout
+        files_column_layout.setContentsMargins(0, 0, 0, 0)
+        files_column_layout.setSpacing(10)
+
+        self.controls_column = QWidget()
+        self.controls_column.setObjectName("controlsColumn")
+        self.controls_column.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        controls_column_layout = QVBoxLayout(self.controls_column)
+        self.controls_column_layout = controls_column_layout
+        controls_column_layout.setContentsMargins(0, 0, 0, 0)
+        controls_column_layout.setSpacing(10)
+
         self.drop_panel = DropPanel()
         self.drop_panel.files_dropped.connect(self.add_files)
         self.drop_panel.choose_requested.connect(self.choose_files)
-        layout.addWidget(self.drop_panel)
+        files_column_layout.addWidget(self.drop_panel)
 
         list_header = QHBoxLayout()
         self.list_header = list_header
@@ -582,7 +612,7 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(self.clear_files)
         list_header.addWidget(self.remove_button)
         list_header.addWidget(self.clear_button)
-        layout.addLayout(list_header)
+        files_column_layout.addLayout(list_header)
 
         self.file_list = QListWidget()
         self.file_list.setObjectName("fileList")
@@ -592,11 +622,11 @@ class MainWindow(QMainWindow):
         self.file_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.file_list.model().rowsMoved.connect(self._sync_source_order)
-        layout.addWidget(self.file_list)
+        files_column_layout.addWidget(self.file_list, 1)
 
         self.output_title_label = QLabel()
         self.output_title_label.setObjectName("sectionTitle")
-        layout.addWidget(self.output_title_label)
+        controls_column_layout.addWidget(self.output_title_label)
 
         output_row = QHBoxLayout()
         self.output_row = output_row
@@ -610,7 +640,7 @@ class MainWindow(QMainWindow):
         self.output_button.setObjectName("secondaryButton")
         self.output_button.clicked.connect(self.choose_output_dir)
         output_row.addWidget(self.output_button)
-        layout.addLayout(output_row)
+        controls_column_layout.addLayout(output_row)
 
         self.output_path_preview = QLabel()
         self.output_path_preview.setObjectName("pathPreview")
@@ -619,7 +649,7 @@ class MainWindow(QMainWindow):
         self.output_path_preview.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        layout.addWidget(self.output_path_preview)
+        controls_column_layout.addWidget(self.output_path_preview)
 
         option_row = QHBoxLayout()
         self.option_row = option_row
@@ -630,12 +660,12 @@ class MainWindow(QMainWindow):
         option_row.addSpacing(18)
         option_row.addWidget(self.reveal_box)
         option_row.addStretch()
-        layout.addLayout(option_row)
+        controls_column_layout.addLayout(option_row)
 
         self.output_hint_label = QLabel()
         self.output_hint_label.setObjectName("muted")
         self.output_hint_label.setWordWrap(True)
-        layout.addWidget(self.output_hint_label)
+        controls_column_layout.addWidget(self.output_hint_label)
 
         footer = QHBoxLayout()
         self.footer = footer
@@ -660,18 +690,22 @@ class MainWindow(QMainWindow):
         self.merge_button.setMinimumWidth(132)
         self.merge_button.clicked.connect(self.start_merge)
         footer.addWidget(self.merge_button)
-        layout.addLayout(footer)
+        controls_column_layout.addLayout(footer)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-        layout.addWidget(self.progress)
+        controls_column_layout.addWidget(self.progress)
 
         self.status_label = QLabel()
         self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        controls_column_layout.addWidget(self.status_label)
+
+        workspace_layout.addWidget(self.files_column)
+        workspace_layout.addWidget(self.controls_column)
+        layout.addWidget(self.workspace, 1)
 
     def _t(self, key: str, **values) -> str:
         return tr(self.language, key, **values)
@@ -773,22 +807,42 @@ class MainWindow(QMainWindow):
             return
 
         width = self.width()
+        wide_workspace = width >= 960
         narrow = width <= 640
         compact = width < 820
         horizontal = QBoxLayout.Direction.LeftToRight
+        vertical = QBoxLayout.Direction.TopToBottom
 
-        if narrow:
+        if wide_workspace:
+            margins = (34, 28, 34, 28)
+        elif narrow:
             margins = (12, 18, 12, 18)
         elif compact:
             margins = (24, 24, 24, 24)
         else:
-            margins = (38, 32, 38, 30)
+            margins = (24, 26, 24, 26)
         self.root_layout.setContentsMargins(*margins)
-        self.root_layout.setSpacing(8 if narrow else 10 if compact else 12)
+        self.root_layout.setSpacing(12 if wide_workspace else 8 if narrow else 10)
 
-        # Keep the control groups horizontal at every supported width. The
-        # responsive behavior is intentionally horizontal-first: tighten the
-        # available width and button minimums instead of stacking the page.
+        # The desktop client uses a real two-column workspace. Only fall back
+        # to stacked columns when the window is too narrow to keep both panels
+        # usable; the controls inside each panel remain horizontal.
+        self.workspace_layout.setDirection(horizontal if wide_workspace else vertical)
+        self.workspace_layout.setSpacing(16 if wide_workspace else 12)
+        self.workspace_layout.setStretch(0, 3 if wide_workspace else 0)
+        self.workspace_layout.setStretch(1, 2 if wide_workspace else 0)
+        self.workspace.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding if wide_workspace else QSizePolicy.Policy.Preferred,
+        )
+        self.files_column.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding if wide_workspace else QSizePolicy.Policy.Preferred,
+        )
+        self.controls_column.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+
         self.header_row.setDirection(horizontal)
         self.header_row.setStretch(0, 1)
         self.output_row.setDirection(horizontal)
@@ -819,8 +873,21 @@ class MainWindow(QMainWindow):
         self.word_status.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        self.drop_panel.setMinimumHeight(104 if narrow else 116 if compact else 128)
-        self.file_list.setMinimumHeight(112 if narrow else 120 if compact else 128)
+        if wide_workspace:
+            drop_height = 148
+            file_list_height = 220
+        elif narrow:
+            drop_height = 104
+            file_list_height = 112
+        else:
+            drop_height = 116 if compact else 128
+            file_list_height = 120 if compact else 140
+        self.drop_panel.setMinimumHeight(drop_height)
+        self.file_list.setMinimumHeight(file_list_height)
+        self.file_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding if wide_workspace else QSizePolicy.Policy.Preferred,
+        )
         button_policy = QSizePolicy.Policy.Preferred
         for button in (
             self.output_button,
