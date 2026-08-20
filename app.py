@@ -50,7 +50,7 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 # Word can become unstable after a long sequence of COM exports even when each
 # document is closed correctly. Keep batches bounded so one large folder cannot
 # poison the rest of the conversion job.
@@ -1456,8 +1456,9 @@ QToolTip {
 
 
 THEME_DARK_STYLE = """
-QWidget#root, QScrollArea#contentScroll {
-    background: #111827;
+QWidget#root, QScrollArea#contentScroll, QAbstractScrollArea#contentScroll,
+QWidget#workspace, QWidget#filesColumn, QWidget#controlsColumn {
+    background: #000000;
     color: #f8fafc;
 }
 QLabel#eyebrow, QLabel#subtitle, QLabel#muted, QLabel#statusLabel,
@@ -1483,7 +1484,7 @@ QFrame#dropPanel[dragActive="true"] {
 }
 QListWidget#fileList, QLineEdit {
     color: #f8fafc;
-    background: #111827;
+    background: #000000;
     border-color: #334155;
     selection-background-color: #1e3a5f;
     selection-color: #f8fafc;
@@ -1534,7 +1535,7 @@ QAbstractItemView#themePopup::item:selected {
 }
 QListWidget#fileList::item {
     color: #f8fafc;
-    background: #111827;
+    background: #000000;
 }
 QListWidget#fileList::item:hover { background: #1f2937; }
 QListWidget#fileList::item:selected { background: #1e3a5f; }
@@ -1568,7 +1569,7 @@ QToolTip {
     border-color: #475569;
 }
 QScrollBar:vertical {
-    background: #111827;
+    background: #000000;
     width: 12px;
     margin: 2px;
 }
@@ -1582,7 +1583,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
     background: transparent;
 }
-QMessageBox, QDialog { background: #111827; color: #f8fafc; }
+QMessageBox, QDialog { background: #000000; color: #f8fafc; }
 """
 
 

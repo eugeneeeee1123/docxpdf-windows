@@ -240,7 +240,7 @@ class AppTests(unittest.TestCase):
                 dark_index = window.theme_combo.findData("dark")
                 window.theme_combo.setCurrentIndex(dark_index)
                 self.assertEqual(window.theme, "dark")
-                self.assertIn("#111827", self.qt_app.styleSheet())
+                self.assertIn("#000000", self.qt_app.styleSheet())
                 settings.setValue.assert_any_call("ui/theme", "dark")
 
                 window.resize(600, 540)
