@@ -245,25 +245,29 @@ class AppTests(unittest.TestCase):
 
                 window.resize(600, 540)
                 window._apply_responsive_layout()
-                self.assertEqual(
-                    window.output_row.direction(),
-                    QBoxLayout.Direction.TopToBottom,
-                )
-                self.assertEqual(
-                    window.footer.direction(),
-                    QBoxLayout.Direction.TopToBottom,
-                )
+                for row in (
+                    window.header_row,
+                    window.list_header,
+                    window.output_row,
+                    window.option_row,
+                    window.footer,
+                ):
+                    self.assertEqual(row.direction(), QBoxLayout.Direction.LeftToRight)
+                self.assertEqual(window.root_layout.contentsMargins().left(), 12)
+                self.assertEqual(window.convert_button.minimumWidth(), 116)
 
                 window.resize(840, 740)
                 window._apply_responsive_layout()
-                self.assertEqual(
-                    window.output_row.direction(),
-                    QBoxLayout.Direction.LeftToRight,
-                )
-                self.assertEqual(
-                    window.footer.direction(),
-                    QBoxLayout.Direction.LeftToRight,
-                )
+                for row in (
+                    window.header_row,
+                    window.list_header,
+                    window.output_row,
+                    window.option_row,
+                    window.footer,
+                ):
+                    self.assertEqual(row.direction(), QBoxLayout.Direction.LeftToRight)
+                self.assertEqual(window.root_layout.contentsMargins().left(), 38)
+                self.assertEqual(window.convert_button.minimumWidth(), 144)
 
                 light_index = window.theme_combo.findData("light")
                 window.theme_combo.setCurrentIndex(light_index)

@@ -773,33 +773,55 @@ class MainWindow(QMainWindow):
             return
 
         width = self.width()
-        narrow = width < 680
+        narrow = width <= 640
         compact = width < 820
         horizontal = QBoxLayout.Direction.LeftToRight
-        vertical = QBoxLayout.Direction.TopToBottom
 
         if narrow:
-            margins = (16, 20, 16, 22)
+            margins = (12, 18, 12, 18)
         elif compact:
-            margins = (24, 26, 24, 26)
+            margins = (24, 24, 24, 24)
         else:
             margins = (38, 32, 38, 30)
         self.root_layout.setContentsMargins(*margins)
-        self.root_layout.setSpacing(10 if compact else 12)
+        self.root_layout.setSpacing(8 if narrow else 10 if compact else 12)
 
-        self.header_row.setDirection(vertical if narrow else horizontal)
-        self.header_row.setStretch(0, 0 if narrow else 1)
-        self.output_row.setDirection(vertical if narrow else horizontal)
-        self.output_row.setStretch(0, 0 if narrow else 1)
-        self.option_row.setDirection(vertical if narrow else horizontal)
-        self.list_header.setDirection(vertical if narrow else horizontal)
-        self.list_header.setStretch(3, 0 if narrow else 1)
-        self.footer.setDirection(vertical if narrow else horizontal)
-        self.footer.setStretch(1, 0 if narrow else 1)
+        # Keep the control groups horizontal at every supported width. The
+        # responsive behavior is intentionally horizontal-first: tighten the
+        # available width and button minimums instead of stacking the page.
+        self.header_row.setDirection(horizontal)
+        self.header_row.setStretch(0, 1)
+        self.output_row.setDirection(horizontal)
+        self.output_row.setStretch(0, 1)
+        self.option_row.setDirection(horizontal)
+        self.list_header.setDirection(horizontal)
+        self.list_header.setStretch(3, 1)
+        self.footer.setDirection(horizontal)
+        self.footer.setStretch(1, 1)
 
-        self.drop_panel.setMinimumHeight(112 if narrow else 128)
-        self.file_list.setMinimumHeight(112 if narrow else 128)
-        button_policy = QSizePolicy.Policy.Expanding if narrow else QSizePolicy.Policy.Preferred
+        combo_width = 88 if narrow else 96 if compact else 104
+        output_button_width = 84 if narrow else 92 if compact else 0
+        convert_button_width = 116 if narrow else 128 if compact else 144
+        merge_button_width = 104 if narrow else 116 if compact else 132
+        self.language_combo.setMinimumWidth(combo_width)
+        self.theme_combo.setMinimumWidth(combo_width)
+        self.output_button.setMinimumWidth(output_button_width)
+        self.cancel_button.setMinimumWidth(84 if narrow else 96 if compact else 0)
+        self.convert_button.setMinimumWidth(convert_button_width)
+        self.merge_button.setMinimumWidth(merge_button_width)
+
+        self.eyebrow_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.order_hint_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.word_status.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.drop_panel.setMinimumHeight(104 if narrow else 116 if compact else 128)
+        self.file_list.setMinimumHeight(112 if narrow else 120 if compact else 128)
+        button_policy = QSizePolicy.Policy.Preferred
         for button in (
             self.output_button,
             self.cancel_button,
