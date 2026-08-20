@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import app
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QBoxLayout
 from converter import ConversionResult
 
 
@@ -225,6 +225,50 @@ class AppTests(unittest.TestCase):
                     self.assertIn("Current folder:", window.output_path_preview.text())
                     settings.setValue.assert_called_with("ui/language", "en")
                     window.close()
+
+    def test_theme_switch_persists_and_layout_adapts_to_narrow_window(self) -> None:
+        settings = MagicMock()
+        settings.value.return_value = ""
+
+        with patch.object(app, "QSettings", return_value=settings):
+            with patch.object(app, "locate_word_app", return_value=None):
+                window = app.MainWindow(language="en")
+                self.assertEqual(window.theme_combo.itemText(0), "Light")
+                self.assertEqual(window.theme_combo.itemText(1), "Dark")
+                self.assertTrue(window.scroll_area.widgetResizable())
+
+                dark_index = window.theme_combo.findData("dark")
+                window.theme_combo.setCurrentIndex(dark_index)
+                self.assertEqual(window.theme, "dark")
+                self.assertIn("#111827", self.qt_app.styleSheet())
+                settings.setValue.assert_any_call("ui/theme", "dark")
+
+                window.resize(600, 540)
+                window._apply_responsive_layout()
+                self.assertEqual(
+                    window.output_row.direction(),
+                    QBoxLayout.Direction.TopToBottom,
+                )
+                self.assertEqual(
+                    window.footer.direction(),
+                    QBoxLayout.Direction.TopToBottom,
+                )
+
+                window.resize(840, 740)
+                window._apply_responsive_layout()
+                self.assertEqual(
+                    window.output_row.direction(),
+                    QBoxLayout.Direction.LeftToRight,
+                )
+                self.assertEqual(
+                    window.footer.direction(),
+                    QBoxLayout.Direction.LeftToRight,
+                )
+
+                light_index = window.theme_combo.findData("light")
+                window.theme_combo.setCurrentIndex(light_index)
+                self.assertEqual(window.theme, "light")
+                window.close()
 
 
 if __name__ == "__main__":

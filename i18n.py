@@ -71,6 +71,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "progress_accessible": {"zh": "转换进度", "en": "Conversion progress"},
     "language_accessible": {"zh": "界面语言", "en": "Interface language"},
     "language_tooltip": {"zh": "切换界面语言", "en": "Change interface language"},
+    "theme_light": {"zh": "浅色", "en": "Light"},
+    "theme_dark": {"zh": "深色", "en": "Dark"},
+    "theme_accessible": {"zh": "界面主题", "en": "Interface theme"},
+    "theme_tooltip": {"zh": "切换浅色或深色主题", "en": "Switch between light and dark themes"},
     # Word and file states.
     "word_ready": {"zh": "● Microsoft Word{version} 已就绪", "en": "● Microsoft Word{version} is ready"},
     "word_missing": {"zh": "● 未找到 Microsoft Word", "en": "● Microsoft Word not found"},

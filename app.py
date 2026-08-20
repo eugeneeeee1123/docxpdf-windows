@@ -14,6 +14,7 @@ from PyQt6.QtGui import QCloseEvent, QFont, QFontDatabase, QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -27,6 +28,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +61,12 @@ WORD_SESSION_DOCUMENT_LIMIT = 32
 # DOCXPDF_WORD_WORKERS=1..4 when troubleshooting a particular machine.
 DEFAULT_PARALLEL_WORD_WORKERS = 2
 MAX_PARALLEL_WORD_WORKERS = 4
+SUPPORTED_THEMES = ("light", "dark")
+
+
+def normalize_theme(value: object) -> str:
+    theme = str(value or "").strip().lower()
+    return theme if theme in SUPPORTED_THEMES else "light"
 
 
 class DropPanel(QFrame):
@@ -453,6 +462,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings()
         saved_language = self.settings.value("ui/language", "")
+        saved_theme = self.settings.value("ui/theme", "light")
         environment_language = os.environ.get("DOCXPDF_LANGUAGE", "")
         if language or environment_language or saved_language:
             requested_language = language or environment_language or str(saved_language)
@@ -463,6 +473,7 @@ class MainWindow(QMainWindow):
                 else "en"
             )
         self.language = normalize_language(requested_language)
+        self.theme = normalize_theme(saved_theme)
         self.sources: list[Path] = []
         self.items: dict[str, QListWidgetItem] = {}
         self.item_states: dict[str, tuple[str, dict[str, object]]] = {}
@@ -475,26 +486,40 @@ class MainWindow(QMainWindow):
         self._status_key = "select_files"
         self._status_values: dict[str, object] = {}
 
-        self.setMinimumSize(760, 660)
+        self.setMinimumSize(520, 540)
         self.resize(840, 740)
         self._build_ui()
         self._retranslate_ui()
+        self._apply_theme()
+        self._apply_responsive_layout()
         self._refresh_word_status()
         self._refresh_actions()
 
     def _build_ui(self) -> None:
         root = QWidget()
         root.setObjectName("root")
-        self.setCentralWidget(root)
+        root.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("contentScroll")
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setWidget(root)
+        self.setCentralWidget(self.scroll_area)
+
         layout = QVBoxLayout(root)
+        self.root_layout = layout
         layout.setContentsMargins(38, 32, 38, 30)
         # Keep the file list and output section visually distinct at the
         # default 840×740 window size; 16px made their minimum heights collide.
         layout.setSpacing(12)
 
         header_row = QHBoxLayout()
+        self.header_row = header_row
         self.eyebrow_label = QLabel()
         self.eyebrow_label.setObjectName("eyebrow")
+        self.eyebrow_label.setWordWrap(True)
         header_row.addWidget(self.eyebrow_label, 1)
         self.language_combo = QComboBox()
         self.language_combo.setObjectName("languageCombo")
@@ -507,6 +532,18 @@ class MainWindow(QMainWindow):
         self.language_combo.setCurrentIndex(max(0, language_index))
         self.language_combo.currentIndexChanged.connect(self.change_language)
         header_row.addWidget(self.language_combo)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.setObjectName("themeCombo")
+        self.theme_combo.addItem("", "light")
+        self.theme_combo.addItem("", "dark")
+        theme_popup = self.theme_combo.view()
+        theme_popup.setObjectName("themePopup")
+        self.theme_combo.setMinimumWidth(104)
+        theme_index = self.theme_combo.findData(self.theme)
+        self.theme_combo.setCurrentIndex(max(0, theme_index))
+        self.theme_combo.currentIndexChanged.connect(self.change_theme)
+        header_row.addWidget(self.theme_combo)
         layout.addLayout(header_row)
 
         self.title_label = QLabel()
@@ -524,6 +561,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.drop_panel)
 
         list_header = QHBoxLayout()
+        self.list_header = list_header
         self.list_title_label = QLabel()
         self.list_title_label.setObjectName("sectionTitle")
         self.count_label = QLabel()
@@ -532,6 +570,7 @@ class MainWindow(QMainWindow):
         list_header.addWidget(self.count_label)
         self.order_hint_label = QLabel()
         self.order_hint_label.setObjectName("muted")
+        self.order_hint_label.setWordWrap(True)
         list_header.addWidget(self.order_hint_label)
         list_header.addStretch()
 
@@ -548,6 +587,8 @@ class MainWindow(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setObjectName("fileList")
         self.file_list.setMinimumHeight(128)
+        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.file_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.file_list.model().rowsMoved.connect(self._sync_source_order)
@@ -558,6 +599,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.output_title_label)
 
         output_row = QHBoxLayout()
+        self.output_row = output_row
         output_row.setSpacing(10)
         self.output_edit = QLineEdit()
         self.output_edit.setClearButtonEnabled(True)
@@ -580,6 +622,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.output_path_preview)
 
         option_row = QHBoxLayout()
+        self.option_row = option_row
         self.overwrite_box = QCheckBox()
         self.reveal_box = QCheckBox()
         self.reveal_box.setChecked(True)
@@ -591,12 +634,15 @@ class MainWindow(QMainWindow):
 
         self.output_hint_label = QLabel()
         self.output_hint_label.setObjectName("muted")
+        self.output_hint_label.setWordWrap(True)
         layout.addWidget(self.output_hint_label)
 
         footer = QHBoxLayout()
+        self.footer = footer
         footer.setSpacing(12)
         self.word_status = QLabel()
         self.word_status.setObjectName("wordStatus")
+        self.word_status.setWordWrap(True)
         footer.addWidget(self.word_status)
         footer.addStretch()
         self.cancel_button = QPushButton()
@@ -686,6 +732,14 @@ class MainWindow(QMainWindow):
         self.progress.setAccessibleName(self._t("progress_accessible"))
         self.language_combo.setAccessibleName(self._t("language_accessible"))
         self.language_combo.setToolTip(self._t("language_tooltip"))
+        light_index = self.theme_combo.findData("light")
+        dark_index = self.theme_combo.findData("dark")
+        if light_index >= 0:
+            self.theme_combo.setItemText(light_index, self._t("theme_light"))
+        if dark_index >= 0:
+            self.theme_combo.setItemText(dark_index, self._t("theme_dark"))
+        self.theme_combo.setAccessibleName(self._t("theme_accessible"))
+        self.theme_combo.setToolTip(self._t("theme_tooltip"))
         for key in self.items:
             self._render_item(key)
         self.status_label.setText(self._translated_status())
@@ -699,6 +753,64 @@ class MainWindow(QMainWindow):
         self.language = language
         self.settings.setValue("ui/language", language)
         self._retranslate_ui()
+
+    @pyqtSlot(int)
+    def change_theme(self, index: int) -> None:
+        theme = normalize_theme(self.theme_combo.itemData(index))
+        if theme == self.theme:
+            return
+        self.theme = theme
+        self.settings.setValue("ui/theme", theme)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        application = QApplication.instance()
+        if application is not None:
+            application.setStyleSheet(stylesheet_for_theme(self.theme))
+
+    def _apply_responsive_layout(self) -> None:
+        if not hasattr(self, "root_layout"):
+            return
+
+        width = self.width()
+        narrow = width < 680
+        compact = width < 820
+        horizontal = QBoxLayout.Direction.LeftToRight
+        vertical = QBoxLayout.Direction.TopToBottom
+
+        if narrow:
+            margins = (16, 20, 16, 22)
+        elif compact:
+            margins = (24, 26, 24, 26)
+        else:
+            margins = (38, 32, 38, 30)
+        self.root_layout.setContentsMargins(*margins)
+        self.root_layout.setSpacing(10 if compact else 12)
+
+        self.header_row.setDirection(vertical if narrow else horizontal)
+        self.header_row.setStretch(0, 0 if narrow else 1)
+        self.output_row.setDirection(vertical if narrow else horizontal)
+        self.output_row.setStretch(0, 0 if narrow else 1)
+        self.option_row.setDirection(vertical if narrow else horizontal)
+        self.list_header.setDirection(vertical if narrow else horizontal)
+        self.list_header.setStretch(3, 0 if narrow else 1)
+        self.footer.setDirection(vertical if narrow else horizontal)
+        self.footer.setStretch(1, 0 if narrow else 1)
+
+        self.drop_panel.setMinimumHeight(112 if narrow else 128)
+        self.file_list.setMinimumHeight(112 if narrow else 128)
+        button_policy = QSizePolicy.Policy.Expanding if narrow else QSizePolicy.Policy.Preferred
+        for button in (
+            self.output_button,
+            self.cancel_button,
+            self.convert_button,
+            self.merge_button,
+        ):
+            button.setSizePolicy(button_policy, QSizePolicy.Policy.Fixed)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
 
     def _refresh_word_status(self) -> None:
         app = locate_word_app()
@@ -733,6 +845,7 @@ class MainWindow(QMainWindow):
             self.drop_panel.setEnabled(enabled)
             self.overwrite_box.setEnabled(enabled)
             self.language_combo.setEnabled(enabled)
+            self.theme_combo.setEnabled(enabled)
             self.cancel_button.setVisible(not enabled)
             self.cancel_button.setEnabled(not enabled)
 
@@ -1071,6 +1184,10 @@ QWidget#root {
     background: #f7f8fb;
     color: #111827;
 }
+QScrollArea#contentScroll {
+    background: #f7f8fb;
+    border: none;
+}
 QLabel#eyebrow {
     color: #64748b;
     font-size: 11px;
@@ -1130,7 +1247,7 @@ QListWidget#fileList, QLineEdit {
     selection-background-color: #dbeafe;
     selection-color: #111827;
 }
-QComboBox#languageCombo {
+QComboBox#languageCombo, QComboBox#themeCombo {
     color: #334155;
     background: #ffffff;
     border: 1px solid #cbd5e1;
@@ -1138,10 +1255,12 @@ QComboBox#languageCombo {
     min-height: 26px;
     padding: 2px 8px;
 }
-QComboBox#languageCombo:hover { border-color: #94a3b8; }
-QComboBox#languageCombo:focus { border: 2px solid #2563eb; }
+QComboBox#languageCombo:hover, QComboBox#themeCombo:hover { border-color: #94a3b8; }
+QComboBox#languageCombo:focus, QComboBox#themeCombo:focus { border: 2px solid #2563eb; }
 QComboBox#languageCombo QAbstractItemView,
-QAbstractItemView#languagePopup {
+QComboBox#themeCombo QAbstractItemView,
+QAbstractItemView#languagePopup,
+QAbstractItemView#themePopup {
     color: #111827;
     background: #ffffff;
     border: 1px solid #cbd5e1;
@@ -1150,19 +1269,25 @@ QAbstractItemView#languagePopup {
     outline: 0;
 }
 QComboBox#languageCombo QAbstractItemView::item,
-QAbstractItemView#languagePopup::item {
+QComboBox#themeCombo QAbstractItemView::item,
+QAbstractItemView#languagePopup::item,
+QAbstractItemView#themePopup::item {
     color: #111827;
     background: #ffffff;
     padding: 7px 10px;
     min-height: 24px;
 }
 QComboBox#languageCombo QAbstractItemView::item:hover,
-QAbstractItemView#languagePopup::item:hover {
+QComboBox#themeCombo QAbstractItemView::item:hover,
+QAbstractItemView#languagePopup::item:hover,
+QAbstractItemView#themePopup::item:hover {
     color: #111827;
     background: #eff6ff;
 }
 QComboBox#languageCombo QAbstractItemView::item:selected,
-QAbstractItemView#languagePopup::item:selected {
+QComboBox#themeCombo QAbstractItemView::item:selected,
+QAbstractItemView#languagePopup::item:selected,
+QAbstractItemView#themePopup::item:selected {
     color: #111827;
     background: #dbeafe;
 }
@@ -1241,6 +1366,141 @@ QToolTip {
 """
 
 
+THEME_DARK_STYLE = """
+QWidget#root, QScrollArea#contentScroll {
+    background: #111827;
+    color: #f8fafc;
+}
+QLabel#eyebrow, QLabel#subtitle, QLabel#muted, QLabel#statusLabel,
+QLabel#dropHint {
+    color: #94a3b8;
+}
+QLabel#title, QLabel#sectionTitle, QLabel#dropTitle {
+    color: #f8fafc;
+}
+QLabel#pathPreview {
+    color: #cbd5e1;
+    background: #1f2937;
+    border-color: #334155;
+}
+QLabel#pathPreview[hasPath="false"] { color: #94a3b8; }
+QFrame#dropPanel {
+    background: #1f2937;
+    border-color: #475569;
+}
+QFrame#dropPanel[dragActive="true"] {
+    background: #172554;
+    border-color: #60a5fa;
+}
+QListWidget#fileList, QLineEdit {
+    color: #f8fafc;
+    background: #111827;
+    border-color: #334155;
+    selection-background-color: #1e3a5f;
+    selection-color: #f8fafc;
+}
+QListWidget#fileList:focus, QLineEdit:focus {
+    border-color: #60a5fa;
+}
+QLineEdit:disabled { color: #64748b; background: #1f2937; }
+QComboBox#languageCombo, QComboBox#themeCombo {
+    color: #e2e8f0;
+    background: #1f2937;
+    border-color: #475569;
+}
+QComboBox#languageCombo:hover, QComboBox#themeCombo:hover {
+    border-color: #94a3b8;
+}
+QComboBox#languageCombo:focus, QComboBox#themeCombo:focus {
+    border-color: #60a5fa;
+}
+QComboBox#languageCombo QAbstractItemView,
+QComboBox#themeCombo QAbstractItemView,
+QAbstractItemView#languagePopup,
+QAbstractItemView#themePopup {
+    color: #f8fafc;
+    background: #1f2937;
+    border-color: #475569;
+    selection-background-color: #1e3a5f;
+    selection-color: #f8fafc;
+}
+QComboBox#languageCombo QAbstractItemView::item,
+QComboBox#themeCombo QAbstractItemView::item,
+QAbstractItemView#languagePopup::item,
+QAbstractItemView#themePopup::item {
+    color: #f8fafc;
+    background: #1f2937;
+}
+QComboBox#languageCombo QAbstractItemView::item:hover,
+QComboBox#themeCombo QAbstractItemView::item:hover,
+QAbstractItemView#languagePopup::item:hover,
+QAbstractItemView#themePopup::item:hover {
+    background: #334155;
+}
+QComboBox#languageCombo QAbstractItemView::item:selected,
+QComboBox#themeCombo QAbstractItemView::item:selected,
+QAbstractItemView#languagePopup::item:selected,
+QAbstractItemView#themePopup::item:selected {
+    background: #1e3a5f;
+}
+QListWidget#fileList::item {
+    color: #f8fafc;
+    background: #111827;
+}
+QListWidget#fileList::item:hover { background: #1f2937; }
+QListWidget#fileList::item:selected { background: #1e3a5f; }
+QListWidget#fileList::item:selected:active { background: #1d4ed8; }
+QPushButton#primaryButton:hover { background: #3b82f6; }
+QPushButton#primaryButton:pressed { background: #1d4ed8; }
+QPushButton#primaryButton:disabled {
+    color: #cbd5e1;
+    background: #334155;
+    border-color: #334155;
+}
+QPushButton#secondaryButton {
+    color: #e2e8f0;
+    background: #1f2937;
+    border-color: #475569;
+}
+QPushButton#secondaryButton:hover { background: #334155; }
+QPushButton#secondaryButton:pressed { background: #475569; }
+QPushButton#quietButton { color: #60a5fa; }
+QPushButton#quietButton:hover { background: #172554; }
+QPushButton#quietButton:disabled { color: #64748b; }
+QPushButton:focus { border-color: #60a5fa; }
+QLabel#wordStatus[available="true"] { color: #4ade80; }
+QLabel#wordStatus[available="false"] { color: #f87171; }
+QProgressBar { background: #334155; }
+QProgressBar::chunk { background: #3b82f6; }
+QCheckBox { color: #cbd5e1; }
+QToolTip {
+    color: #f8fafc;
+    background: #0f172a;
+    border-color: #475569;
+}
+QScrollBar:vertical {
+    background: #111827;
+    width: 12px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: #475569;
+    min-height: 32px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover { background: #64748b; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+    background: transparent;
+}
+QMessageBox, QDialog { background: #111827; color: #f8fafc; }
+"""
+
+
+def stylesheet_for_theme(theme: str) -> str:
+    return STYLE + (THEME_DARK_STYLE if normalize_theme(theme) == "dark" else "")
+
+
 def configure_application(app: QApplication) -> None:
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
@@ -1252,7 +1512,7 @@ def configure_application(app: QApplication) -> None:
     if windows_font.is_file():
         QFontDatabase.addApplicationFont(str(windows_font))
     app.setFont(QFont("Microsoft YaHei UI", 10))
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(stylesheet_for_theme("light"))
 
 
 def main() -> int:
