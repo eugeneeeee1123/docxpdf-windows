@@ -11,7 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import app
 from PyQt6.QtWidgets import QApplication, QBoxLayout
-from converter import ConversionResult
+from PyQt6.QtCore import QEventLoop, QTimer
+from converter import ConversionResult, MergeResult
 
 
 class AppTests(unittest.TestCase):
@@ -19,6 +20,128 @@ class AppTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.qt_app = QApplication.instance() or QApplication([])
         app.configure_application(cls.qt_app)
+
+    def test_two_step_pdf_merge_preserves_images_order_and_inputs_without_word(self) -> None:
+        from PIL import Image
+        from pypdf import PdfReader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            docs = [folder / "one.docx", folder / "two.docx"]
+            pdfs = [folder / "Merged.pdf", folder / "第二份.pdf"]
+            for index, (doc, pdf) in enumerate(zip(docs, pdfs)):
+                doc.touch()
+                Image.new("RGB", (32 + index, 40), (10 + index, 20, 30)).save(pdf, "PDF", quality=95)
+            original_files = [pdf.read_bytes() for pdf in pdfs]
+            original_streams = [
+                PdfReader(pdf).pages[0].images[0].indirect_reference.get_object()._data
+                for pdf in pdfs
+            ]
+            settings = MagicMock()
+            settings.value.return_value = ""
+            with patch.object(app, "QSettings", return_value=settings), patch.object(app, "locate_word_app", return_value=None), patch.object(app, "WordSession") as word, patch.object(app.os, "startfile") as open_folder:
+                window = app.MainWindow(language="en")
+                window.reveal_box.setChecked(False)
+                window.add_files(docs)
+                results = [ConversionResult(doc.resolve(), pdf.resolve(), pdf.stat().st_size, 0.1) for doc, pdf in zip(docs, pdfs)]
+                window.on_conversion_finished(results, [], None, False)
+                window.mode_combo.setCurrentIndex(window.mode_combo.findData("pdf"))
+                self.assertEqual(window.sources, [pdf.resolve() for pdf in pdfs])
+                self.assertTrue(window.merge_button.isEnabled())
+                self.assertTrue(window.convert_button.isHidden())
+                window.overwrite_box.setChecked(True)
+                window.reveal_box.setChecked(True)
+                first = window.file_list.takeItem(0)
+                window.file_list.addItem(first)
+                window._sync_source_order()
+                window.language_combo.setCurrentIndex(window.language_combo.findData("zh"))
+                self.assertEqual(window.merge_button.text(), "合并 PDF")
+                window.language_combo.setCurrentIndex(window.language_combo.findData("en"))
+                loop = QEventLoop()
+                window.start_merge()
+                thread = window.thread
+                timer = QTimer()
+                timer.setSingleShot(True)
+                timer.timeout.connect(loop.quit)
+                timer.start(5000)
+                thread.finished.connect(loop.quit)
+                loop.exec()
+                timer.stop()
+                if window.running:
+                    window.worker.request_cancel()
+                    thread.quit()
+                    thread.wait(5000)
+                self.assertFalse(window.running)
+                self.assertIn("Merge complete: 2 PDFs", window.status_label.text())
+                merged = PdfReader(folder / "Merged-1.pdf")
+                self.assertEqual([page.images[0].indirect_reference.get_object()._data for page in merged.pages], list(reversed(original_streams)))
+                self.assertEqual([pdf.read_bytes() for pdf in pdfs], original_files)
+                open_folder.assert_called_once_with(str(folder.resolve()), "explore")
+                word.assert_not_called()
+                window.mode_combo.setCurrentIndex(window.mode_combo.findData("docx"))
+                self.assertEqual(window.sources, [doc.resolve() for doc in docs])
+                window.mode_combo.setCurrentIndex(window.mode_combo.findData("pdf"))
+                self.assertEqual(window.sources, [pdf.resolve() for pdf in reversed(pdfs)])
+                window.close()
+
+    def test_finished_opens_actual_output_folder_and_reports_open_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            input_folder = folder / "Documents"
+            output_folder = folder / "输出 location"
+            input_folder.mkdir()
+            output_folder.mkdir()
+            sources = [input_folder / "one.pdf", input_folder / "two.pdf"]
+            for source in sources:
+                source.touch()
+            output = output_folder / "合并 result.pdf"
+            output.touch()
+            result = MergeResult(tuple(sources), output, 2, 100, 0.1)
+            with patch.object(app, "QSettings", return_value=MagicMock()), patch.object(app, "locate_word_app", return_value=None):
+                window = app.MainWindow(language="en")
+                window.mode_combo.setCurrentIndex(window.mode_combo.findData("pdf"))
+                window.add_files(sources)
+                window.job_merge = window.job_pdf_merge = True
+                # The folder must come from the saved result, even if the edit
+                # still displays Documents; never pass a PDF to ShellExecute.
+                with patch.object(app.os, "startfile") as open_folder:
+                    window.on_conversion_finished([], [], result, False)
+                    open_folder.assert_called_once_with(str(output_folder.resolve()), "explore")
+                    self.assertEqual(window.reveal_box.text(), "Open output folder when finished")
+                    window.reveal_box.setChecked(False)
+                    window.on_conversion_finished([], [], result, False)
+                    self.assertEqual(open_folder.call_count, 1)
+                window.reveal_box.setChecked(True)
+                with patch.object(app.os, "startfile", side_effect=OSError("Explorer unavailable")), patch.object(window, "_show_warning") as warning:
+                    window.on_conversion_finished([], [], result, False)
+                    self.assertEqual(warning.call_args.args[0], "open_output_failed_title")
+                    self.assertIn(str(output_folder.resolve()), warning.call_args.args[1])
+                    self.assertIn("Merge complete", window.status_label.text())
+                window.close()
+
+    def test_pdf_mode_filters_picker_and_drop_files(self) -> None:
+        from PyQt6.QtCore import QMimeData, QUrl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            pdf, doc = folder / "one.PDF", folder / "one.docx"
+            pdf.touch()
+            doc.touch()
+            with patch.object(app, "QSettings", return_value=MagicMock()), patch.object(app, "locate_word_app", return_value=None):
+                window = app.MainWindow(language="en")
+                window.mode_combo.setCurrentIndex(window.mode_combo.findData("pdf"))
+                event = MagicMock()
+                mime = QMimeData()
+                mime.setUrls([QUrl.fromLocalFile(str(pdf)), QUrl.fromLocalFile(str(doc))])
+                event.mimeData.return_value = mime
+                self.assertEqual(window.drop_panel._file_paths(event), [pdf])
+                with patch.object(app.QFileDialog, "getOpenFileNames", return_value=([str(pdf)], "")) as picker:
+                    window.choose_files()
+                self.assertEqual(picker.call_args.args[-1], "PDF documents (*.pdf)")
+                window.add_files([pdf, doc])
+                self.assertEqual(window.sources, [pdf.resolve()])
+                self.assertFalse(window.merge_button.isEnabled())
+                window.close()
 
     def test_diagnostic_convert_writes_a_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

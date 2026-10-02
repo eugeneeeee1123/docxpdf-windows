@@ -8,7 +8,7 @@ import platform
 import shutil
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -37,6 +37,13 @@ class ConversionError(RuntimeError):
         self.abort_batch = abort_batch
 
 
+class MergeCancelled(ConversionError):
+    """The merge was cancelled before publishing its output."""
+
+    def __init__(self) -> None:
+        super().__init__("PDF merge cancelled")
+
+
 @dataclass(frozen=True)
 class ConversionResult:
     source: Path
@@ -45,6 +52,7 @@ class ConversionResult:
     elapsed_seconds: float
     images_restored: int = 0
     images_examined: int = 0
+    output_relocated: bool = False
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,7 @@ class MergeResult:
     page_count: int
     size_bytes: int
     elapsed_seconds: float
+    output_relocated: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,11 +251,11 @@ def _wait_for_pdf(path: Path, timeout: float = 8.0) -> bool:
     return path.is_file()
 
 
-def _replace_with_retry(source: Path, destination: Path, *, timeout: float = 6.0) -> None:
+def _replace_with_retry(source: Path, destination: Path, *, timeout: float = 10.0) -> None:
     """Atomically replace a PDF, tolerating brief sync-client file locks."""
     deadline = time.monotonic() + max(0.0, timeout)
     delay = 0.08
-    retryable_errors = {errno.EACCES, errno.EPERM, 32}
+    retryable_errors = {errno.EACCES, errno.EPERM, 5, 32, 33}
     while True:
         try:
             os.replace(source, destination)
@@ -257,6 +266,36 @@ def _replace_with_retry(source: Path, destination: Path, *, timeout: float = 6.0
                 raise
             time.sleep(min(delay, max(0.01, deadline - time.monotonic())))
             delay = min(delay * 2, 0.8)
+
+
+def _publish_pdf(
+    source: Path,
+    destination: Path,
+    *,
+    language: str = DEFAULT_LANGUAGE,
+    retry_timeout: float = 10.0,
+) -> tuple[Path, bool]:
+    """Publish a staged PDF without losing work to an occupied destination.
+
+    OneDrive and PDF viewers can keep a just-synced output file open. First
+    wait for that transient lock. If it stays occupied, preserve the result
+    under the next available filename instead of failing the completed job.
+    """
+    try:
+        _replace_with_retry(source, destination, timeout=retry_timeout)
+        return destination, False
+    except OSError as original_error:
+        error_code = (
+            original_error.winerror
+            if getattr(original_error, "winerror", None)
+            else original_error.errno
+        )
+        if error_code not in {errno.EACCES, errno.EPERM, 5, 32, 33}:
+            raise
+
+    alternate = next_output_path(destination, destination.parent, language=language)
+    _replace_with_retry(source, alternate, timeout=retry_timeout)
+    return alternate, True
 
 
 def _load_com_modules(language: str = DEFAULT_LANGUAGE) -> tuple[ModuleType, Any]:
@@ -862,7 +901,9 @@ class WordSession:
                 language=self.language,
             )
             size = _check_pdf(temporary_output, language=self.language)
-            _replace_with_retry(temporary_output, output_path)
+            output_path, output_relocated = _publish_pdf(
+                temporary_output, output_path, language=self.language
+            )
         except ConversionError:
             raise
         except OSError as exc:
@@ -879,6 +920,7 @@ class WordSession:
             elapsed_seconds=time.monotonic() - started,
             images_restored=quality_report.images_restored,
             images_examined=quality_report.images_examined,
+            output_relocated=output_relocated,
         )
 
 
@@ -906,6 +948,8 @@ def merge_pdfs(
     *,
     overwrite: bool = False,
     language: str = DEFAULT_LANGUAGE,
+    cancel_requested: Callable[[], bool] | None = None,
+    on_file_merged: Callable[[Path, int, int], None] | None = None,
 ) -> MergeResult:
     """Concatenate PDF pages without rasterizing or re-encoding page images."""
     if len(pdfs) < 2:
@@ -925,29 +969,45 @@ def merge_pdfs(
         raise ConversionError(tr(language, "merge_pypdf_required")) from exc
 
     input_paths = tuple(Path(pdf).expanduser().resolve() for pdf in pdfs)
+    if output_path in input_paths:
+        raise ConversionError(tr(language, "merge_output_input"))
     for path in input_paths:
         if not path.is_file() or path.suffix.lower() != ".pdf":
             raise ConversionError(tr(language, "merge_input_missing", path=path))
         _check_pdf(path, language=language)
 
-    temporary_output = output_path.with_name(f".docxpdf-stage-{uuid.uuid4().hex}.pdf")
+    # A regular staging name avoids problems some sync clients have with
+    # hidden files in a OneDrive-controlled output folder.
+    temporary_output = output_path.with_name(f"DocxPDF-merge-{uuid.uuid4().hex}.pdf")
     started = time.monotonic()
     writer = PdfWriter()
     readers = []
     page_count = 0
     try:
-        for path in input_paths:
+        for index, path in enumerate(input_paths, start=1):
+            if cancel_requested and cancel_requested():
+                raise MergeCancelled()
             reader = PdfReader(str(path), strict=False)
+            readers.append(reader)
             if reader.is_encrypted:
                 raise ConversionError(tr(language, "merge_encrypted", name=path.name))
-            readers.append(reader)
             for page in reader.pages:
+                if cancel_requested and cancel_requested():
+                    raise MergeCancelled()
                 writer.add_page(page)
                 page_count += 1
+            if on_file_merged:
+                on_file_merged(path, index, len(input_paths))
+        if cancel_requested and cancel_requested():
+            raise MergeCancelled()
         with temporary_output.open("wb") as stream:
             writer.write(stream)
         size = _check_pdf(temporary_output, language=language)
-        _replace_with_retry(temporary_output, output_path)
+        if cancel_requested and cancel_requested():
+            raise MergeCancelled()
+        output_path, output_relocated = _publish_pdf(
+            temporary_output, output_path, language=language
+        )
     except ConversionError:
         raise
     except Exception as exc:
@@ -965,4 +1025,5 @@ def merge_pdfs(
         page_count=page_count,
         size_bytes=size,
         elapsed_seconds=time.monotonic() - started,
+        output_relocated=output_relocated,
     )

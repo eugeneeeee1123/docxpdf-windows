@@ -30,17 +30,9 @@ $DistPath = Join-Path $ProjectDir $DistDirectoryName
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
-    --windowed `
-    --onedir `
-    --noupx `
-    --name DocxPDF `
-    --hidden-import pythoncom `
-    --hidden-import pywintypes `
-    --hidden-import win32com.client `
     --distpath $DistPath `
     --workpath (Join-Path $ProjectDir "build") `
-    --specpath (Join-Path $ProjectDir "build") `
-    (Join-Path $ProjectDir "app.py")
+    (Join-Path $ProjectDir "packaging\DocxPDF.spec")
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed; no ZIP was created."
 }
@@ -51,6 +43,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $AppDir "DocxPDF.exe"))) {
     throw "PyInstaller did not create DocxPDF.exe."
 }
 
+Copy-Item -LiteralPath (Join-Path $ProjectDir "README.md"), (Join-Path $ProjectDir "README.en.md"), (Join-Path $ProjectDir "LICENSE") -Destination $AppDir
 Compress-Archive -Path $AppDir -DestinationPath $ZipPath -Force
 Write-Host "Created: $AppDir"
 Write-Host "Created: $ZipPath"

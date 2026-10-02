@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -37,6 +36,7 @@ from PyQt6.QtWidgets import (
 from converter import (
     ConversionError,
     ConversionResult,
+    MergeCancelled,
     WordSession,
     convert_docx,
     ensure_output_dir,
@@ -50,7 +50,7 @@ from i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 
 APP_NAME = "DocxPDF"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.13"
 # Word can become unstable after a long sequence of COM exports even when each
 # document is closed correctly. Keep batches bounded so one large folder cannot
 # poison the rest of the conversion job.
@@ -79,6 +79,7 @@ class DropPanel(QFrame):
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumHeight(128)
+        self.extension = ".docx"
 
         self.title_label = QLabel()
         self.title_label.setObjectName("dropTitle")
@@ -95,22 +96,22 @@ class DropPanel(QFrame):
         layout.addWidget(self.hint_label)
         layout.addStretch()
 
-    def set_language(self, language: str) -> None:
-        self.title_label.setText(tr(language, "drop_title"))
+    def set_language(self, language: str, *, pdf: bool = False) -> None:
+        self.extension = ".pdf" if pdf else ".docx"
+        self.title_label.setText(tr(language, "pdf_drop_title" if pdf else "drop_title"))
         self.hint_label.setText(tr(language, "drop_hint"))
 
-    @staticmethod
-    def _docx_paths(event) -> list[Path]:
+    def _file_paths(self, event) -> list[Path]:
         if not event.mimeData().hasUrls():
             return []
         return [
             Path(url.toLocalFile())
             for url in event.mimeData().urls()
-            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".docx"
+            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == self.extension
         ]
 
     def dragEnterEvent(self, event) -> None:
-        if self._docx_paths(event):
+        if self._file_paths(event):
             self.setProperty("dragActive", True)
             self.style().unpolish(self)
             self.style().polish(self)
@@ -125,7 +126,7 @@ class DropPanel(QFrame):
         event.accept()
 
     def dropEvent(self, event) -> None:
-        paths = self._docx_paths(event)
+        paths = self._file_paths(event)
         self.setProperty("dragActive", False)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -457,6 +458,45 @@ class ConversionWorker(QObject):
                 temporary_dir.cleanup()
 
 
+class PDFMergeWorker(QObject):
+    merge_started = pyqtSignal()
+    file_merged = pyqtSignal(str, int, int)
+    finished = pyqtSignal(object, object, object, bool)
+
+    def __init__(self, sources: list[Path], output_dir: Path, overwrite: bool, language: str) -> None:
+        super().__init__()
+        self.sources = sources
+        self.output_dir = output_dir
+        self.overwrite = overwrite
+        self.language = language
+        self._cancel_event = Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            output = next_merge_path(self.output_dir, self.overwrite, language=self.language)
+            if output.resolve() in self.sources:
+                output = next_merge_path(self.output_dir, False, language=self.language)
+            self.merge_started.emit()
+            result = merge_pdfs(
+                self.sources,
+                output,
+                overwrite=self.overwrite,
+                language=self.language,
+                cancel_requested=self._cancel_event.is_set,
+                on_file_merged=lambda path, index, total: self.file_merged.emit(str(path), index, total),
+            )
+        except MergeCancelled:
+            self.finished.emit([], [], None, True)
+        except Exception as exc:
+            self.finished.emit([], [(Path(tr(self.language, "merge_result_label")), str(exc))], None, False)
+        else:
+            self.finished.emit([], [], result, False)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *, language: str | None = None) -> None:
         super().__init__()
@@ -475,12 +515,15 @@ class MainWindow(QMainWindow):
         self.language = normalize_language(requested_language)
         self.theme = normalize_theme(saved_theme)
         self.sources: list[Path] = []
+        self.mode = "docx"
+        self.queues: dict[str, list[Path]] = {"docx": [], "pdf": []}
         self.items: dict[str, QListWidgetItem] = {}
         self.item_states: dict[str, tuple[str, dict[str, object]]] = {}
         self.thread: QThread | None = None
-        self.worker: ConversionWorker | None = None
+        self.worker: ConversionWorker | PDFMergeWorker | None = None
         self.running = False
         self.job_merge = False
+        self.job_pdf_merge = False
         self.close_after_cancel = False
         self._completed_files = 0
         self._status_key = "select_files"
@@ -554,6 +597,13 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.title_label)
         layout.addWidget(self.subtitle_label)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("modeCombo")
+        self.mode_combo.addItem("", "docx")
+        self.mode_combo.addItem("", "pdf")
+        self.mode_combo.currentIndexChanged.connect(self.change_mode)
+        layout.addWidget(self.mode_combo)
 
         self.workspace = QWidget()
         self.workspace.setObjectName("workspace")
@@ -719,10 +769,12 @@ class MainWindow(QMainWindow):
         values = dict(self._status_values)
         quality_count = int(values.pop("_quality_count", 0))
         quality_key = str(values.pop("_quality_key", "quality_note"))
+        output_relocated = bool(values.pop("_output_relocated", False))
         if self._status_key in {"file_completed", "merge_completed", "all_completed"}:
             values["quality_note"] = (
                 self._t(quality_key, count=quality_count) if quality_count else ""
             )
+        values["output_note"] = self._t("output_locked_note") if output_relocated else ""
         return self._t(self._status_key, **values)
 
     def _render_item(self, key: str) -> None:
@@ -736,17 +788,21 @@ class MainWindow(QMainWindow):
         )
 
     def _retranslate_ui(self) -> None:
-        self.setWindowTitle(self._t("app_name"))
-        self.eyebrow_label.setText(self._t("eyebrow"))
-        self.title_label.setText(self._t("title"))
-        self.subtitle_label.setText(self._t("subtitle"))
-        self.drop_panel.set_language(self.language)
-        self.list_title_label.setText(self._t("files_section"))
+        self.setWindowTitle(f"{self._t('app_name')} · {APP_VERSION}")
+        pdf = self.mode == "pdf"
+        for index, key in enumerate(("mode_docx", "mode_pdf")):
+            self.mode_combo.setItemText(index, self._t(key))
+        self.mode_combo.setAccessibleName(self._t("mode_accessible"))
+        self.eyebrow_label.setText(self._t("pdf_eyebrow" if pdf else "eyebrow"))
+        self.title_label.setText(self._t("pdf_title" if pdf else "title"))
+        self.subtitle_label.setText(self._t("pdf_subtitle" if pdf else "subtitle"))
+        self.drop_panel.set_language(self.language, pdf=pdf)
+        self.list_title_label.setText(self._t("pdf_files_section" if pdf else "files_section"))
         self.count_label.setText(self._t("file_count", count=len(self.sources)))
-        self.order_hint_label.setText(self._t("order_hint"))
+        self.order_hint_label.setText(self._t("pdf_order_hint" if pdf else "order_hint"))
         self.remove_button.setText(self._t("remove_selected"))
         self.clear_button.setText(self._t("clear"))
-        self.file_list.setAccessibleName(self._t("file_list_accessible"))
+        self.file_list.setAccessibleName(self._t("pdf_list_accessible" if pdf else "file_list_accessible"))
         self.output_title_label.setText(self._t("output_section"))
         self.output_edit.setPlaceholderText(self._t("output_placeholder"))
         self.output_edit.setAccessibleName(self._t("output_accessible"))
@@ -756,14 +812,15 @@ class MainWindow(QMainWindow):
         self.overwrite_box.setText(self._t("overwrite"))
         self.overwrite_box.setToolTip(self._t("overwrite_tooltip"))
         self.reveal_box.setText(self._t("reveal"))
-        self.output_hint_label.setText(self._t("output_hint"))
+        self.output_hint_label.setText(self._t("pdf_output_hint" if pdf else "output_hint"))
         self.cancel_button.setText(self._t("cancel_task"))
-        self.cancel_button.setToolTip(self._t("cancel_tooltip"))
+        self.cancel_button.setToolTip(self._t("pdf_cancel_tooltip" if pdf else "cancel_tooltip"))
+        self.convert_button.setVisible(not pdf)
         self.convert_button.setText(self._t("convert_individual"))
         self.convert_button.setToolTip(self._t("convert_individual_tooltip"))
-        self.merge_button.setText(self._t("convert_merge"))
-        self.merge_button.setToolTip(self._t("convert_merge_tooltip"))
-        self.progress.setAccessibleName(self._t("progress_accessible"))
+        self.merge_button.setText(self._t("merge_pdf" if pdf else "convert_merge"))
+        self.merge_button.setToolTip(self._t("pdf_subtitle" if pdf else "convert_merge_tooltip"))
+        self.progress.setAccessibleName(self._t("pdf_progress_accessible" if pdf else "progress_accessible"))
         self.language_combo.setAccessibleName(self._t("language_accessible"))
         self.language_combo.setToolTip(self._t("language_tooltip"))
         light_index = self.theme_combo.findData("light")
@@ -778,6 +835,27 @@ class MainWindow(QMainWindow):
             self._render_item(key)
         self.status_label.setText(self._translated_status())
         self._refresh_word_status()
+
+    @pyqtSlot(int)
+    def change_mode(self, index: int) -> None:
+        mode = self.mode_combo.itemData(index)
+        if self.running or self.thread is not None or mode == self.mode or mode not in self.queues:
+            return
+        self._sync_source_order()
+        self.queues[self.mode] = list(self.sources)
+        self.mode = mode
+        saved_sources = list(self.queues[mode])
+        self.sources = []
+        self.items.clear()
+        self.item_states.clear()
+        self.file_list.clear()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._set_status("pdf_select_files" if mode == "pdf" else "select_files")
+        self._retranslate_ui()
+        if saved_sources:
+            self.add_files(saved_sources)
+        self._refresh_actions()
 
     @pyqtSlot(int)
     def change_language(self, index: int) -> None:
@@ -902,6 +980,13 @@ class MainWindow(QMainWindow):
         self._apply_responsive_layout()
 
     def _refresh_word_status(self) -> None:
+        if self.mode == "pdf":
+            self.word_status.setText(self._t("pdf_ready"))
+            self.word_status.setToolTip(self._t("pdf_subtitle"))
+            self.word_status.setProperty("available", True)
+            self.word_status.style().unpolish(self.word_status)
+            self.word_status.style().polish(self.word_status)
+            return
         app = locate_word_app()
         version = word_version(app)
         if app:
@@ -919,8 +1004,8 @@ class MainWindow(QMainWindow):
     def _refresh_actions(self) -> None:
         has_files = bool(self.sources)
         has_output = bool(self.output_edit.text().strip()) if hasattr(self, "output_edit") else False
-        word_ready = locate_word_app() is not None
-        enabled = not self.running if hasattr(self, "running") else True
+        word_ready = self.mode == "pdf" or locate_word_app() is not None
+        enabled = not (self.running or self.thread is not None)
         if hasattr(self, "convert_button"):
             self.convert_button.setEnabled(has_files and has_output and word_ready and enabled)
             self.merge_button.setEnabled(
@@ -935,6 +1020,10 @@ class MainWindow(QMainWindow):
             self.overwrite_box.setEnabled(enabled)
             self.language_combo.setEnabled(enabled)
             self.theme_combo.setEnabled(enabled)
+            self.mode_combo.setEnabled(enabled)
+            self.file_list.setDragDropMode(
+                QAbstractItemView.DragDropMode.InternalMove if enabled else QAbstractItemView.DragDropMode.NoDragDrop
+            )
             self.cancel_button.setVisible(not enabled)
             self.cancel_button.setEnabled(not enabled)
 
@@ -962,20 +1051,23 @@ class MainWindow(QMainWindow):
     def choose_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            self._t("choose_docs_title"),
+            self._t("choose_pdfs_title" if self.mode == "pdf" else "choose_docs_title"),
             str(Path.home() / "Documents"),
-            self._t("word_documents_filter"),
+            self._t("pdf_documents_filter" if self.mode == "pdf" else "word_documents_filter"),
         )
         if paths:
             self.add_files([Path(path) for path in paths])
 
     @pyqtSlot(object)
     def add_files(self, paths) -> None:
+        if self.running or self.thread is not None:
+            return
         added = 0
         skipped = 0
         for raw_path in paths:
             path = Path(raw_path).expanduser()
-            if not path.is_file() or path.suffix.lower() != ".docx" or path.name.startswith("~$"):
+            extension = ".pdf" if self.mode == "pdf" else ".docx"
+            if not path.is_file() or path.suffix.lower() != extension or path.name.startswith("~$"):
                 skipped += 1
                 continue
             resolved = path.resolve()
@@ -998,11 +1090,11 @@ class MainWindow(QMainWindow):
         self.count_label.setText(self._t("file_count", count=len(self.sources)))
         if added:
             if skipped:
-                self._set_status("files_added_skipped", added=added, skipped=skipped)
+                self._set_status("pdf_files_added_skipped" if self.mode == "pdf" else "files_added_skipped", added=added, skipped=skipped)
             else:
-                self._set_status("files_added", added=added)
+                self._set_status("pdf_files_added" if self.mode == "pdf" else "files_added", added=added)
         elif skipped:
-            self._set_status("no_valid_files")
+            self._set_status("pdf_no_valid_files" if self.mode == "pdf" else "no_valid_files")
         self._refresh_actions()
 
     @pyqtSlot()
@@ -1027,7 +1119,7 @@ class MainWindow(QMainWindow):
         self.item_states.clear()
         self.file_list.clear()
         self.count_label.setText(self._t("file_count", count=0))
-        self._set_status("select_files")
+        self._set_status("pdf_select_files" if self.mode == "pdf" else "select_files")
         self._refresh_actions()
 
     @pyqtSlot()
@@ -1063,6 +1155,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def start_conversion(self) -> None:
+        if self.mode == "pdf":
+            return
         self._start_job(merge=False)
 
     @pyqtSlot()
@@ -1070,7 +1164,7 @@ class MainWindow(QMainWindow):
         self._start_job(merge=True)
 
     def _start_job(self, *, merge: bool) -> None:
-        if self.running:
+        if self.running or self.thread is not None:
             return
         if not self.sources or not self.output_edit.text().strip():
             return
@@ -1093,27 +1187,32 @@ class MainWindow(QMainWindow):
 
         self.running = True
         self.job_merge = merge
+        self.job_pdf_merge = self.mode == "pdf"
         self.progress.setRange(0, len(self.sources) + (1 if merge else 0))
         self.progress.setValue(0)
         self._completed_files = 0
-        self._set_status("starting_word" if not merge else "starting_merge")
+        self._set_status("merging" if self.job_pdf_merge else "starting_word" if not merge else "starting_merge")
         for source in self.sources:
             self._set_item_status(source, "waiting")
         self._refresh_actions()
 
         self.thread = QThread(self)
-        self.worker = ConversionWorker(
-            list(self.sources),
-            output_dir,
-            self.overwrite_box.isChecked(),
-            merge,
-            self.language,
-        )
+        if self.job_pdf_merge:
+            self.worker = PDFMergeWorker(
+                list(self.sources), output_dir, self.overwrite_box.isChecked(), self.language
+            )
+        else:
+            self.worker = ConversionWorker(
+                list(self.sources), output_dir, self.overwrite_box.isChecked(), merge, self.language
+            )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.file_started.connect(self.on_file_started)
-        self.worker.file_succeeded.connect(self.on_file_succeeded)
-        self.worker.file_failed.connect(self.on_file_failed)
+        if self.job_pdf_merge:
+            self.worker.file_merged.connect(self.on_pdf_merged)
+        else:
+            self.worker.file_started.connect(self.on_file_started)
+            self.worker.file_succeeded.connect(self.on_file_succeeded)
+            self.worker.file_failed.connect(self.on_file_failed)
         self.worker.merge_started.connect(self.on_merge_started)
         self.worker.finished.connect(self.on_conversion_finished)
         self.worker.finished.connect(self.thread.quit)
@@ -1128,7 +1227,7 @@ class MainWindow(QMainWindow):
             return
         self.worker.request_cancel()
         self.cancel_button.setEnabled(False)
-        self._set_status("cancel_requested")
+        self._set_status("pdf_cancel_requested" if self.job_pdf_merge else "cancel_requested")
 
     @pyqtSlot(str, int, int)
     def on_file_started(self, source: str, index: int, total: int) -> None:
@@ -1160,6 +1259,7 @@ class MainWindow(QMainWindow):
             name=result.output.name,
             size_mb=size_mb,
             _quality_count=result.images_restored,
+            _output_relocated=result.output_relocated,
         )
 
     @pyqtSlot(str, str, int, int)
@@ -1171,14 +1271,28 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def on_merge_started(self) -> None:
-        self.progress.setValue(len(self.sources))
+        self.progress.setValue(0 if self.job_pdf_merge else len(self.sources))
         self._set_status("merging")
+
+    @pyqtSlot(str, int, int)
+    def on_pdf_merged(self, source: str, index: int, total: int) -> None:
+        self._set_item_status(source, "processing")
+        self.progress.setValue(index)
 
     @pyqtSlot(object, object, object, bool)
     def on_conversion_finished(self, results, errors, merged_result, cancelled) -> None:
         self.running = False
         source_keys = {str(source) for source in self.sources}
         handled = {str(result.source) for result in results}
+        if self.job_pdf_merge and merged_result:
+            handled.update(str(path) for path in merged_result.inputs)
+            for path in merged_result.inputs:
+                self._set_item_status(path, "complete")
+        elif not self.job_merge:
+            for result in results:
+                output = result.output.resolve()
+                if output not in self.queues["pdf"]:
+                    self.queues["pdf"].append(output)
         handled.update(
             str(path) for path, _message in errors if str(path) in source_keys
         )
@@ -1190,15 +1304,16 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
         if cancelled:
-            self._set_status("job_cancelled", count=len(results))
+            self._set_status("pdf_merge_cancelled" if self.job_pdf_merge else "job_cancelled", count=len(results))
         elif merged_result and not errors:
             restored = sum(result.images_restored for result in results)
             self._set_status(
-                "merge_completed",
-                count=len(results),
+                "pdf_merge_completed" if self.job_pdf_merge else "merge_completed",
+                count=len(merged_result.inputs) if self.job_pdf_merge else len(results),
                 name=merged_result.output.name,
                 pages=merged_result.page_count,
                 _quality_count=restored,
+                _output_relocated=merged_result.output_relocated,
             )
         elif results and not errors:
             restored = sum(result.images_restored for result in results)
@@ -1215,47 +1330,48 @@ class MainWindow(QMainWindow):
                 failed=len(errors),
             )
         else:
-            self._set_status("conversion_failed")
+            self._set_status("pdf_merge_failed" if self.job_pdf_merge else "conversion_failed")
 
         if errors:
             details = "\n\n".join(f"{path.name}\n{message}" for path, message in errors[:5])
             if len(errors) > 5:
                 details += "\n\n" + self._t("more_failures", count=len(errors) - 5)
-            self._show_warning("partial_failure_title", details)
+            self._show_warning("pdf_merge_failure_title" if self.job_pdf_merge else "partial_failure_title", details)
 
         reveal_path = merged_result.output if merged_result else None
         if reveal_path is None and results and not self.job_merge:
             reveal_path = results[0].output
         if reveal_path and self.reveal_box.isChecked():
+            output_folder = reveal_path.resolve().parent
             try:
-                if merged_result or len(results) == 1:
-                    subprocess.Popen(["explorer.exe", f"/select,{reveal_path}"])
-                else:
-                    os.startfile(str(reveal_path.parent))
-            except OSError:
-                pass
-
-        self.worker = None
-        self.thread = None
+                os.startfile(str(output_folder), "explore")
+            except OSError as exc:
+                self._show_warning(
+                    "open_output_failed_title",
+                    self._t("open_output_failed", path=output_folder, error=exc),
+                )
 
     @pyqtSlot()
     def on_thread_finished(self) -> None:
+        self.worker = None
+        self.thread = None
+        self._refresh_actions()
         if self.close_after_cancel:
             self.close_after_cancel = False
             QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.running:
+        if self.running or self.thread is not None:
             dialog = QMessageBox(self)
             dialog.setIcon(QMessageBox.Icon.Question)
-            dialog.setWindowTitle(self._t("conversion_in_progress_title"))
-            dialog.setText(self._t("conversion_in_progress_message"))
+            dialog.setWindowTitle(self._t("pdf_in_progress_title" if self.job_pdf_merge else "conversion_in_progress_title"))
+            dialog.setText(self._t("pdf_in_progress_message" if self.job_pdf_merge else "conversion_in_progress_message"))
             stop_button = dialog.addButton(
                 self._t("stop_remaining"),
                 QMessageBox.ButtonRole.AcceptRole,
             )
             keep_button = dialog.addButton(
-                self._t("keep_running"),
+                self._t("pdf_keep_running" if self.job_pdf_merge else "keep_running"),
                 QMessageBox.ButtonRole.RejectRole,
             )
             dialog.setDefaultButton(keep_button)
@@ -1336,7 +1452,7 @@ QListWidget#fileList, QLineEdit {
     selection-background-color: #dbeafe;
     selection-color: #111827;
 }
-QComboBox#languageCombo, QComboBox#themeCombo {
+QComboBox#languageCombo, QComboBox#themeCombo, QComboBox#modeCombo {
     color: #334155;
     background: #ffffff;
     border: 1px solid #cbd5e1;
@@ -1344,10 +1460,11 @@ QComboBox#languageCombo, QComboBox#themeCombo {
     min-height: 26px;
     padding: 2px 8px;
 }
-QComboBox#languageCombo:hover, QComboBox#themeCombo:hover { border-color: #94a3b8; }
-QComboBox#languageCombo:focus, QComboBox#themeCombo:focus { border: 2px solid #2563eb; }
+QComboBox#languageCombo:hover, QComboBox#themeCombo:hover, QComboBox#modeCombo:hover { border-color: #94a3b8; }
+QComboBox#languageCombo:focus, QComboBox#themeCombo:focus, QComboBox#modeCombo:focus { border: 2px solid #2563eb; }
 QComboBox#languageCombo QAbstractItemView,
 QComboBox#themeCombo QAbstractItemView,
+QComboBox#modeCombo QAbstractItemView,
 QAbstractItemView#languagePopup,
 QAbstractItemView#themePopup {
     color: #111827;
@@ -1359,6 +1476,7 @@ QAbstractItemView#themePopup {
 }
 QComboBox#languageCombo QAbstractItemView::item,
 QComboBox#themeCombo QAbstractItemView::item,
+QComboBox#modeCombo QAbstractItemView::item,
 QAbstractItemView#languagePopup::item,
 QAbstractItemView#themePopup::item {
     color: #111827;
@@ -1368,6 +1486,7 @@ QAbstractItemView#themePopup::item {
 }
 QComboBox#languageCombo QAbstractItemView::item:hover,
 QComboBox#themeCombo QAbstractItemView::item:hover,
+QComboBox#modeCombo QAbstractItemView::item:hover,
 QAbstractItemView#languagePopup::item:hover,
 QAbstractItemView#themePopup::item:hover {
     color: #111827;
@@ -1375,6 +1494,7 @@ QAbstractItemView#themePopup::item:hover {
 }
 QComboBox#languageCombo QAbstractItemView::item:selected,
 QComboBox#themeCombo QAbstractItemView::item:selected,
+QComboBox#modeCombo QAbstractItemView::item:selected,
 QAbstractItemView#languagePopup::item:selected,
 QAbstractItemView#themePopup::item:selected {
     color: #111827;
@@ -1493,19 +1613,20 @@ QListWidget#fileList:focus, QLineEdit:focus {
     border-color: #60a5fa;
 }
 QLineEdit:disabled { color: #64748b; background: #1f2937; }
-QComboBox#languageCombo, QComboBox#themeCombo {
+QComboBox#languageCombo, QComboBox#themeCombo, QComboBox#modeCombo {
     color: #e2e8f0;
     background: #1f2937;
     border-color: #475569;
 }
-QComboBox#languageCombo:hover, QComboBox#themeCombo:hover {
+QComboBox#languageCombo:hover, QComboBox#themeCombo:hover, QComboBox#modeCombo:hover {
     border-color: #94a3b8;
 }
-QComboBox#languageCombo:focus, QComboBox#themeCombo:focus {
+QComboBox#languageCombo:focus, QComboBox#themeCombo:focus, QComboBox#modeCombo:focus {
     border-color: #60a5fa;
 }
 QComboBox#languageCombo QAbstractItemView,
 QComboBox#themeCombo QAbstractItemView,
+QComboBox#modeCombo QAbstractItemView,
 QAbstractItemView#languagePopup,
 QAbstractItemView#themePopup {
     color: #f8fafc;
@@ -1516,6 +1637,7 @@ QAbstractItemView#themePopup {
 }
 QComboBox#languageCombo QAbstractItemView::item,
 QComboBox#themeCombo QAbstractItemView::item,
+QComboBox#modeCombo QAbstractItemView::item,
 QAbstractItemView#languagePopup::item,
 QAbstractItemView#themePopup::item {
     color: #f8fafc;
@@ -1523,12 +1645,14 @@ QAbstractItemView#themePopup::item {
 }
 QComboBox#languageCombo QAbstractItemView::item:hover,
 QComboBox#themeCombo QAbstractItemView::item:hover,
+QComboBox#modeCombo QAbstractItemView::item:hover,
 QAbstractItemView#languagePopup::item:hover,
 QAbstractItemView#themePopup::item:hover {
     background: #334155;
 }
 QComboBox#languageCombo QAbstractItemView::item:selected,
 QComboBox#themeCombo QAbstractItemView::item:selected,
+QComboBox#modeCombo QAbstractItemView::item:selected,
 QAbstractItemView#languagePopup::item:selected,
 QAbstractItemView#themePopup::item:selected {
     background: #1e3a5f;

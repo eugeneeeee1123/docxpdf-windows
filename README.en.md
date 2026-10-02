@@ -12,16 +12,21 @@ DocxPDF is a local desktop app that uses an installed copy of Microsoft Word to 
 
 - Select or drag and drop multiple `.docx` files
 - Create a separate PDF for each DOCX
+- Merge existing PDFs in a separate mode: select or drop PDFs, reorder them, and merge without re-encoding images or requiring Microsoft Word
 - Reorder files by dragging, then convert and merge them into one PDF
 - Choose a custom output folder
 - Protect existing files by adding `-1`, `-2`, and so on unless overwrite is enabled
-- Background processing, per-file states, cancellation after the current file, and File Explorer reveal
+- Background processing, per-file states, cancellation after the current file, and opening the actual output folder in File Explorer when finished
 - Up to two isolated Word sessions process batch files in parallel by default, while list and merge order remain stable
 - Desktop horizontal two-column workspace with the file queue on the left and output controls on the right, falling back to a compact stack only when the window is narrow, plus saved light/dark theme switching
 - Unicode, spaces, and long filenames supported
 - Instant 中文/English switching; follows the Windows language on first launch and remembers the user's choice
 
 ## Fidelity approach
+
+For a two-step workflow, click **Convert to separate PDFs** in **Step 1 · Convert DOCX**, then switch to **Step 2 · Merge PDFs**. Successfully converted PDFs are automatically added to the merge queue; you can also choose or drop other PDFs. Drag to set the order, choose an output folder, and click **Merge PDFs**. Each mode keeps its own file queue. Merging requires at least two unencrypted PDFs, supports cancellation, and prevents the output from overwriting an input PDF.
+
+If OneDrive, File Explorer preview, or a PDF reader temporarily holds an output file open, the app waits first. If the file remains occupied, the completed result is saved using a new `-1`, `-2`, and so on filename and the status reports it.
 
 1. An isolated, hidden Microsoft Word instance opens each DOCX read-only and exports it using Word's print-quality PDF renderer.
 2. Word's `OptimizeForImageQuality` option is enabled.

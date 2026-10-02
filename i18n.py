@@ -8,6 +8,45 @@ SUPPORTED_LANGUAGES = ("zh", "en")
 
 
 STRINGS: dict[str, dict[str, str]] = {
+    "mode_docx": {"zh": "第 1 步 · DOCX 转换", "en": "Step 1 · Convert DOCX"},
+    "mode_pdf": {"zh": "第 2 步 · PDF 合并", "en": "Step 2 · Merge PDFs"},
+    "mode_accessible": {"zh": "选择 DOCX 转换或 PDF 合并", "en": "Choose DOCX conversion or PDF merging"},
+    "pdf_eyebrow": {"zh": "WINDOWS · PDF 页面合并", "en": "WINDOWS · PDF PAGE MERGING"},
+    "pdf_title": {"zh": "合并 PDF，保持图片质量", "en": "Merge PDFs, preserve image quality"},
+    "pdf_subtitle": {
+        "zh": "直接合并现有 PDF，保留图片流与页面内容；无需 Microsoft Word。",
+        "en": "Merge existing PDFs, preserving image streams and page content. Microsoft Word is not required.",
+    },
+    "pdf_drop_title": {"zh": "拖放 PDF 到这里", "en": "Drop PDF files here"},
+    "pdf_files_section": {"zh": "待合并 PDF", "en": "PDFs to merge"},
+    "pdf_list_accessible": {"zh": "待合并 PDF 文件列表", "en": "PDF files to merge"},
+    "pdf_order_hint": {"zh": "拖动可调整合并顺序", "en": "Drag to change merge order"},
+    "pdf_progress_accessible": {"zh": "PDF 合并进度", "en": "PDF merge progress"},
+    "pdf_keep_running": {"zh": "继续合并", "en": "Keep merging"},
+    "pdf_output_hint": {
+        "zh": "拖动调整顺序后点击“合并 PDF”，生成“合并结果.pdf”。第一步生成的独立 PDF 会保留。",
+        "en": "Drag to set the order, then click Merge PDFs to create Merged.pdf. Separate PDFs from step 1 are kept.",
+    },
+    "merge_pdf": {"zh": "合并 PDF", "en": "Merge PDFs"},
+    "pdf_ready": {"zh": "● PDF 合并已就绪", "en": "● PDF merging is ready"},
+    "pdf_select_files": {"zh": "请选择至少两个 PDF 文件。", "en": "Choose at least two PDF files."},
+    "pdf_files_added": {"zh": "已加入 {added} 个 PDF，拖动可调整合并顺序。", "en": "Added {added} PDF(s). Drag to change merge order."},
+    "pdf_files_added_skipped": {
+        "zh": "已加入 {added} 个 PDF，忽略 {skipped} 个无效或重复文件。",
+        "en": "Added {added} PDF(s); skipped {skipped} invalid or duplicate file(s).",
+    },
+    "pdf_no_valid_files": {"zh": "未添加文件：请选择有效且未重复的 .pdf 文件。", "en": "No files added. Choose valid, non-duplicate .pdf files."},
+    "choose_pdfs_title": {"zh": "选择要合并的 PDF", "en": "Choose PDFs to merge"},
+    "pdf_documents_filter": {"zh": "PDF 文档 (*.pdf)", "en": "PDF documents (*.pdf)"},
+    "pdf_merge_completed": {"zh": "合并完成：{count} 个 PDF → {name}（{pages} 页）{output_note}", "en": "Merge complete: {count} PDFs → {name} ({pages} pages){output_note}"},
+    "pdf_merge_failed": {"zh": "PDF 合并失败，未生成合并结果。", "en": "PDF merge failed. No merged output was created."},
+    "pdf_merge_failure_title": {"zh": "PDF 合并失败", "en": "PDF merge failed"},
+    "pdf_cancel_tooltip": {"zh": "在下一次页面处理或写出完成后停止合并", "en": "Stop merging after the current page operation or output write finishes"},
+    "pdf_cancel_requested": {"zh": "已请求取消合并；正在等待当前页面处理或写出完成。", "en": "Cancellation requested. Waiting for the current page operation or output write to finish."},
+    "pdf_merge_cancelled": {"zh": "合并已取消，未生成合并结果。", "en": "Merge cancelled. No merged output was created."},
+    "pdf_in_progress_title": {"zh": "PDF 合并仍在进行", "en": "PDF merge in progress"},
+    "pdf_in_progress_message": {"zh": "要取消合并并退出吗？当前页面处理或写出结束后退出。", "en": "Cancel the merge and exit after the current page operation or output write finishes?"},
+    "merge_output_input": {"zh": "合并结果不能覆盖任何输入 PDF，请使用其他文件名。", "en": "The merged output cannot overwrite an input PDF. Use a different filename."},
     # Application shell and controls.
     "app_name": {"zh": "DocxPDF 保真转换器", "en": "DocxPDF Fidelity Converter"},
     "eyebrow": {
@@ -48,7 +87,12 @@ STRINGS: dict[str, dict[str, str]] = {
         "zh": "未勾选时会自动添加 -1、-2，避免覆盖已有文件。",
         "en": "When off, -1, -2, and so on are added to protect existing files.",
     },
-    "reveal": {"zh": "完成后在文件资源管理器中显示", "en": "Show in File Explorer when finished"},
+    "reveal": {"zh": "完成后打开输出文件夹", "en": "Open output folder when finished"},
+    "open_output_failed_title": {"zh": "无法打开输出文件夹", "en": "Unable to open output folder"},
+    "open_output_failed": {
+        "zh": "文件已保存，但无法自动打开输出文件夹：\n{path}\n\n{error}",
+        "en": "The output was saved, but its folder could not be opened automatically:\n{path}\n\n{error}",
+    },
     "output_hint": {
         "zh": "独立转换沿用原文件名；合并会按列表顺序生成“合并结果.pdf”。",
         "en": "Individual PDFs keep their source names; merge creates “Merged.pdf” in list order.",
@@ -131,8 +175,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Converting {index}/{total}: {name}",
     },
     "file_completed": {
-        "zh": "已完成 {index}/{total}：{name} · {size_mb:.1f} MB{quality_note}",
-        "en": "Completed {index}/{total}: {name} · {size_mb:.1f} MB{quality_note}",
+        "zh": "已完成 {index}/{total}：{name} · {size_mb:.1f} MB{quality_note}{output_note}",
+        "en": "Completed {index}/{total}: {name} · {size_mb:.1f} MB{quality_note}{output_note}",
     },
     "file_error": {"zh": "{name}：{message}", "en": "{name}: {message}"},
     "merging": {
@@ -144,12 +188,16 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Task cancelled; {count} file(s) finished before cancellation.",
     },
     "merge_completed": {
-        "zh": "合并完成：{count} 个 DOCX → {name}（{pages} 页）{quality_note}",
-        "en": "Merge complete: {count} DOCX file(s) → {name} ({pages} pages){quality_note}",
+        "zh": "合并完成：{count} 个 DOCX → {name}（{pages} 页）{quality_note}{output_note}",
+        "en": "Merge complete: {count} DOCX file(s) → {name} ({pages} pages){quality_note}{output_note}",
     },
     "all_completed": {
         "zh": "全部完成：已生成 {count} 个 PDF{quality_note}。",
         "en": "All done: created {count} PDF file(s){quality_note}.",
+    },
+    "output_locked_note": {
+        "zh": " · 原目标文件被占用，已改用新文件名保存",
+        "en": " · Original output was occupied; saved under a new filename",
     },
     "partial_completed": {
         "zh": "转换结束：成功 {success} 个，失败 {failed} 个。",

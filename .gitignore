@@ -13,6 +13,7 @@ build/
 dist/
 dist-*/
 *.spec
+!packaging/DocxPDF.spec
 
 # Local conversion output and diagnostics
 *.pdf

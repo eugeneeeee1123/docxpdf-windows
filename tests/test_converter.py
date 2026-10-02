@@ -96,6 +96,7 @@ class ConverterTests(unittest.TestCase):
         source = Path("source.pdf")
         destination = Path("destination.pdf")
         denied = PermissionError(errno.EACCES, "Access is denied")
+        denied.winerror = 5
         with patch.object(converter.os, "replace", side_effect=[denied, None]) as replace:
             with patch.object(converter.time, "sleep") as sleep:
                 converter._replace_with_retry(source, destination, timeout=1)
@@ -111,6 +112,27 @@ class ConverterTests(unittest.TestCase):
             (folder / "说明.pdf").write_bytes(b"existing")
             self.assertEqual(converter.next_output_path(source, folder).name, "说明-1.pdf")
             self.assertEqual(converter.next_merge_path(folder).name, "合并结果.pdf")
+
+    @unittest.skipUnless(os.name == "nt", "Requires Windows file sharing semantics")
+    def test_publish_pdf_uses_safe_name_when_existing_output_stays_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "DocxPDF-merge-stage.pdf"
+            destination = folder / "Merged.pdf"
+            source.write_bytes(b"%PDF-1.7\nstaged")
+            destination.write_bytes(b"%PDF-1.7\nopen")
+            # A real open Windows file handle denies replacement. This exposes
+            # WinError 5, which a mock containing only errno.EACCES misses.
+            with destination.open("rb"):
+                published, relocated = converter._publish_pdf(
+                    source, destination, language="en", retry_timeout=0
+                )
+
+            self.assertEqual(published, folder / "Merged-1.pdf")
+            self.assertTrue(relocated)
+            self.assertEqual(destination.read_bytes(), b"%PDF-1.7\nopen")
+            self.assertEqual(published.read_bytes(), b"%PDF-1.7\nstaged")
+            self.assertFalse(source.exists())
 
     def test_english_errors_and_merge_filename(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -324,6 +346,47 @@ class ConverterTests(unittest.TestCase):
                 for index in range(2)
             ]
             self.assertEqual(before, after)
+
+    def test_merge_cancellation_after_write_preserves_existing_output(self) -> None:
+        from pypdf import PdfWriter
+        from threading import Event
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            paths = [folder / "one.pdf", folder / "two.pdf", folder / "merged.pdf"]
+            for path in paths:
+                writer = PdfWriter()
+                writer.add_blank_page(width=100, height=100)
+                writer.write(path)
+            original = paths[-1].read_bytes()
+            cancelled = Event()
+            check_pdf = converter._check_pdf
+
+            def cancel_after_staged_file(path, **kwargs):
+                size = check_pdf(path, **kwargs)
+                if path.name.startswith("DocxPDF-merge-"):
+                    cancelled.set()
+                return size
+
+            with patch.object(converter, "_check_pdf", side_effect=cancel_after_staged_file):
+                with self.assertRaises(converter.MergeCancelled):
+                    converter.merge_pdfs(paths[:2], paths[-1], overwrite=True, cancel_requested=cancelled.is_set)
+            self.assertEqual(paths[-1].read_bytes(), original)
+            self.assertFalse(list(folder.glob("DocxPDF-merge-*")))
+
+    def test_merge_output_cannot_replace_an_input(self) -> None:
+        from pypdf import PdfWriter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / "one.pdf", Path(tmp) / "two.pdf"]
+            for path in paths:
+                writer = PdfWriter()
+                writer.add_blank_page(width=100, height=100)
+                writer.write(path)
+            originals = [path.read_bytes() for path in paths]
+            with self.assertRaisesRegex(converter.ConversionError, "cannot overwrite an input"):
+                converter.merge_pdfs(paths, paths[0], overwrite=True, language="en")
+            self.assertEqual([path.read_bytes() for path in paths], originals)
 
 
 if __name__ == "__main__":
