@@ -28,12 +28,12 @@ For a two-step workflow, click **Convert to separate PDFs** in **Step 1 · Conve
 
 If OneDrive, File Explorer preview, or a PDF reader temporarily holds an output file open, the app waits first. If the file remains occupied, the completed result is saved using a new `-1`, `-2`, and so on filename and the status reports it.
 
-1. An isolated, hidden Microsoft Word instance opens each DOCX read-only and exports it using Word's print-quality PDF renderer.
+1. An isolated, hidden Microsoft Word instance opens each DOCX read-only and exports it using Word's print-quality PDF renderer. If one document is still not exported after 10 minutes (for example, Word is stuck on a hidden dialog), only that Word process is closed and the remaining files continue.
 2. Word's `OptimizeForImageQuality` option is enabled.
-3. Word for Windows may still downsample some images. After export, DocxPDF compares PDF images with the original DOCX media. Only unambiguous, high-confidence matches are restored as lossless Flate image streams. Page size, content stream, placement, and geometry are left unchanged.
+3. Word for Windows may still downsample some images. After export, DocxPDF compares PDF images with the original DOCX media. Only unambiguous, high-confidence matches are restored as lossless Flate image streams. Page size, content stream, placement, and geometry are left unchanged. This includes semi-transparent PNGs; pictures cropped inside Word get the cropped region back at its native resolution.
 4. Merging copies PDF pages without rasterizing them or re-encoding embedded image streams.
 
-“Original image restored” means that the resulting raster pixels match the image stored in the DOCX. It does not mean that the PDF compression bytes are identical to the original image file. Images that cannot be matched safely are left as Word exported them. WMF/EMF, linked images, unusual high-bit-depth formats, and some special effects remain under Word's control.
+“Original image restored” means that the resulting raster pixels match the image stored in the DOCX. It does not mean that the PDF compression bytes are identical to the original image file. Images that cannot be matched safely are left as Word exported them, and the completion status says how many. WMF/EMF, linked images, unusual high-bit-depth formats, and some special effects remain under Word's control.
 
 ## Requirements
 

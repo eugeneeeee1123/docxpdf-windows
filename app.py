@@ -5,7 +5,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Event, Lock
+from threading import Event, Lock, Timer
 from typing import Any
 
 from PyQt6.QtCore import QLocale, QObject, QSettings, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from converter import (
+    ConversionCancelled,
     ConversionError,
     ConversionResult,
     MergeCancelled,
@@ -61,6 +62,10 @@ WORD_SESSION_DOCUMENT_LIMIT = 32
 # DOCXPDF_WORD_WORKERS=1..4 when troubleshooting a particular machine.
 DEFAULT_PARALLEL_WORD_WORKERS = 2
 MAX_PARALLEL_WORD_WORKERS = 4
+# Cancel normally lets the current Word export finish. An export still running
+# this long after Cancel is treated as stuck on a hidden dialog and its Word
+# process is ended, so Cancel and close never wait for the per-file watchdog.
+CANCEL_ABORT_GRACE_SECONDS = 15
 SUPPORTED_THEMES = ("light", "dark")
 
 
@@ -167,11 +172,55 @@ class ConversionWorker(QObject):
         self.parallel_workers = parallel_workers
         self._cancel_event = Event()
         self._stop_event = Event()
+        # Each lane's open WordSession -> whether it is running an export. The
+        # cancel timer reads these from its own thread, so they share a lock.
+        self._sessions_lock = Lock()
+        self._active_sessions: dict[Any, bool] = {}
+        self._cancel_aborted: set[Any] = set()
+        self._cancel_timer: Timer | None = None
+        self._run_done = False
 
     def request_cancel(self) -> None:
-        """Stop after the current Word export returns."""
+        """Stop the batch once the current Word export returns.
+
+        A file whose export has returned is not saved: image restoration stops
+        at the next image and the file is reported as cancelled. An export still
+        running CANCEL_ABORT_GRACE_SECONDS later is ended by closing its Word
+        process; that file is reported as cancelled too.
+        """
         self.cancel_requested = True
         self._cancel_event.set()
+        with self._sessions_lock:
+            if self._cancel_timer is not None or self._run_done:
+                return
+            self._cancel_timer = Timer(CANCEL_ABORT_GRACE_SECONDS, self._abort_running_exports)
+            self._cancel_timer.daemon = True
+            self._cancel_timer.start()
+
+    def _abort_running_exports(self) -> None:
+        with self._sessions_lock:
+            running = [session for session, exporting in self._active_sessions.items() if exporting]
+            self._cancel_aborted.update(running)
+        for session in running:
+            try:
+                session.abort()
+            except Exception:
+                pass
+
+    def _begin_export(self, session: Any) -> bool:
+        """Mark an export as running, unless cancel has already been requested."""
+        with self._sessions_lock:
+            if self._cancel_event.is_set():
+                return False
+            self._active_sessions[session] = True
+            return True
+
+    def _end_export(self, session: Any) -> bool:
+        """Mark an export as finished; True if cancel ended its Word process."""
+        with self._sessions_lock:
+            if session in self._active_sessions:
+                self._active_sessions[session] = False
+            return session in self._cancel_aborted
 
     def _worker_count(self, total: int) -> int:
         if total < 2:
@@ -226,7 +275,8 @@ class ConversionWorker(QObject):
 
         Each lane owns its WordSession from start to finish. No COM object is
         shared between Python threads; only plain paths and result records cross
-        the lane boundary.
+        the lane boundary. The cancel timer only calls WordSession.abort(),
+        which ends the Word process through a handle, not through COM.
         """
         session_context: Any | None = None
         session: Any | None = None
@@ -235,6 +285,9 @@ class ConversionWorker(QObject):
 
         def close_session() -> None:
             nonlocal session_context, session, session_entered, documents_in_session
+            if session is not None:
+                with self._sessions_lock:
+                    self._active_sessions.pop(session, None)
             self._close_session(session_context, session_entered)
             session_context = None
             session = None
@@ -253,6 +306,8 @@ class ConversionWorker(QObject):
                 session = None
                 session_entered = False
                 raise
+            with self._sessions_lock:
+                self._active_sessions[session] = False
 
         try:
             while not self._cancel_event.is_set() and not self._stop_event.is_set():
@@ -287,6 +342,8 @@ class ConversionWorker(QObject):
                             self._stop_event.set()
                             continue
 
+                    if not self._begin_export(session):
+                        continue
                     source = self.sources[index - 1]
                     self.file_started.emit(str(source), index, total)
                     output = output_paths[index]
@@ -295,9 +352,25 @@ class ConversionWorker(QObject):
                             source,
                             output,
                             overwrite=True if self.merge else self.overwrite,
-                            timeout=300,
+                            # Also the watchdog limit: a Word export still running
+                            # after this is treated as hung and its Word is closed.
+                            timeout=600,
+                            # Cancel also stops image restoration; the file is
+                            # then discarded instead of saved.
+                            cancel_requested=self._cancel_event.is_set,
                         )
+                    except ConversionCancelled:
+                        # Cancel arrived after Word's export, during restoration
+                        # or before saving. Nothing was saved and it is not a failure.
+                        self._end_export(session)
+                        close_session()
+                        continue
                     except ConversionError as exc:
+                        if self._end_export(session):
+                            # Cancel ended this stuck export. The file was not
+                            # converted, which is a cancellation, not a failure.
+                            close_session()
+                            continue
                         message = str(exc)
                         with state_lock:
                             source_errors[index] = (source, message)
@@ -309,12 +382,18 @@ class ConversionWorker(QObject):
                             self._stop_event.set()
                         continue
                     except Exception as exc:
+                        if self._end_export(session):
+                            close_session()
+                            continue
                         message = tr(self.language, "unexpected_error", error=exc)
                         with state_lock:
                             source_errors[index] = (source, message)
                         self.file_failed.emit(str(source), message, index, total)
                         close_session()
                         continue
+                    # A returned result was saved before cancel was seen, so it
+                    # is kept even if the cancel timer also ended this idle Word.
+                    self._end_export(session)
 
                     with state_lock:
                         results[index] = result
@@ -454,6 +533,11 @@ class ConversionWorker(QObject):
             )
             self.finished.emit(results, errors, None, cancelled)
         finally:
+            with self._sessions_lock:
+                self._run_done = True
+                cancel_timer = self._cancel_timer
+            if cancel_timer is not None:
+                cancel_timer.cancel()
             if temporary_dir is not None:
                 temporary_dir.cleanup()
 
@@ -769,10 +853,14 @@ class MainWindow(QMainWindow):
         values = dict(self._status_values)
         quality_count = int(values.pop("_quality_count", 0))
         quality_key = str(values.pop("_quality_key", "quality_note"))
+        unrestored_count = int(values.pop("_unrestored_count", 0))
+        unrestored_key = str(values.pop("_unrestored_key", "unrestored_note"))
         output_relocated = bool(values.pop("_output_relocated", False))
         if self._status_key in {"file_completed", "merge_completed", "all_completed"}:
             values["quality_note"] = (
                 self._t(quality_key, count=quality_count) if quality_count else ""
+            ) + (
+                self._t(unrestored_key, count=unrestored_count) if unrestored_count else ""
             )
         values["output_note"] = self._t("output_locked_note") if output_relocated else ""
         return self._t(self._status_key, **values)
@@ -783,9 +871,12 @@ class MainWindow(QMainWindow):
         if item is None or state is None:
             return
         state_key, values = state
-        item.setText(
-            f"{Path(key).name}    ·    {self._t('item_' + state_key, **values)}"
-        )
+        values = dict(values)
+        unrestored_count = int(values.pop("_unrestored_count", 0))
+        text = self._t("item_" + state_key, **values)
+        if unrestored_count:
+            text += self._t("unrestored_note", count=unrestored_count)
+        item.setText(f"{Path(key).name}    ·    {text}")
 
     def _retranslate_ui(self) -> None:
         self.setWindowTitle(f"{self._t('app_name')} · {APP_VERSION}")
@@ -1246,9 +1337,14 @@ class MainWindow(QMainWindow):
                 result.source,
                 "complete_quality",
                 count=result.images_restored,
+                _unrestored_count=result.images_unrestored,
             )
         else:
-            self._set_item_status(result.source, "complete")
+            self._set_item_status(
+                result.source,
+                "complete",
+                _unrestored_count=result.images_unrestored,
+            )
         self._completed_files += 1
         self.progress.setValue(self._completed_files)
         size_mb = result.size_bytes / (1024 * 1024)
@@ -1259,6 +1355,7 @@ class MainWindow(QMainWindow):
             name=result.output.name,
             size_mb=size_mb,
             _quality_count=result.images_restored,
+            _unrestored_count=result.images_unrestored,
             _output_relocated=result.output_relocated,
         )
 
@@ -1307,21 +1404,26 @@ class MainWindow(QMainWindow):
             self._set_status("pdf_merge_cancelled" if self.job_pdf_merge else "job_cancelled", count=len(results))
         elif merged_result and not errors:
             restored = sum(result.images_restored for result in results)
+            unrestored = sum(result.images_unrestored for result in results)
             self._set_status(
                 "pdf_merge_completed" if self.job_pdf_merge else "merge_completed",
                 count=len(merged_result.inputs) if self.job_pdf_merge else len(results),
                 name=merged_result.output.name,
                 pages=merged_result.page_count,
                 _quality_count=restored,
+                _unrestored_count=unrestored,
                 _output_relocated=merged_result.output_relocated,
             )
         elif results and not errors:
             restored = sum(result.images_restored for result in results)
+            unrestored = sum(result.images_unrestored for result in results)
             self._set_status(
                 "all_completed",
                 count=len(results),
                 _quality_count=restored,
                 _quality_key="quality_note_comma",
+                _unrestored_count=unrestored,
+                _unrestored_key="unrestored_note_comma",
             )
         elif results:
             self._set_status(

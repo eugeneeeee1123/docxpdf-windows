@@ -5,15 +5,18 @@ import hashlib
 import errno
 import os
 import platform
+import posixpath
 import shutil
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
 from i18n import DEFAULT_LANGUAGE, normalize_language, tr
@@ -27,6 +30,9 @@ WD_EXPORT_ALL_DOCUMENT = 0
 WD_EXPORT_DOCUMENT_CONTENT = 0
 WD_EXPORT_CREATE_HEADING_BOOKMARKS = 1
 MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
+# Upper bound for one document's open + export inside Word when the caller does
+# not pass a timeout. Past it, the watchdog ends that session's WINWORD.EXE.
+DEFAULT_WORD_TIMEOUT = 600.0
 
 
 class ConversionError(RuntimeError):
@@ -44,6 +50,13 @@ class MergeCancelled(ConversionError):
         super().__init__("PDF merge cancelled")
 
 
+class ConversionCancelled(ConversionError):
+    """The conversion was cancelled after Word's export, before publishing its output."""
+
+    def __init__(self) -> None:
+        super().__init__("Conversion cancelled")
+
+
 @dataclass(frozen=True)
 class ConversionResult:
     source: Path
@@ -53,6 +66,11 @@ class ConversionResult:
     images_restored: int = 0
     images_examined: int = 0
     output_relocated: bool = False
+
+    @property
+    def images_unrestored(self) -> int:
+        """PDF images that still carry Word's (possibly downsampled) pixels."""
+        return max(0, self.images_examined - self.images_restored)
 
 
 @dataclass(frozen=True)
@@ -78,6 +96,18 @@ class _DocxImage:
     image: Any
     digest: str
     comparison_sample: Any
+    # Pixel box of a picture cropped inside Word. Word exports only this region,
+    # so it is matched and restored instead of the whole media file.
+    crop_box: tuple[int, int, int, int] | None = None
+    # Lazily built samples of the source composited onto a PDF /Matte colour.
+    matte_samples: dict[tuple[int, int, int], Any] = field(default_factory=dict)
+
+    @property
+    def size(self) -> tuple[int, int]:
+        if self.crop_box is None:
+            return self.image.size
+        left, top, right, bottom = self.crop_box
+        return right - left, bottom - top
 
 
 def _candidate_from_override(raw: str) -> Path | None:
@@ -368,26 +398,239 @@ def _friendly_com_error(
 COMPARISON_SAMPLE_SIZE = (64, 64)
 IMAGE_MATCH_THRESHOLD = 0.985
 IMAGE_MATCH_AMBIGUITY_MARGIN = 0.002
+WHITE = (255, 255, 255)
+
+_PACKAGE_RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_OFFICE_RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_DRAWINGML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+# DrawingML crop edges are stored in thousandths of a percent.
+_DRAWINGML_FULL_EXTENT = 100_000
 
 
-def _flatten_for_comparison(image: Any, image_module: Any) -> Any:
-    if "A" in image.getbands() or "transparency" in image.info:
+def _has_alpha(image: Any) -> bool:
+    return "A" in image.getbands() or "transparency" in image.info
+
+
+def _flatten_for_comparison(
+    image: Any,
+    image_module: Any,
+    background: tuple[int, int, int] = WHITE,
+) -> Any:
+    if _has_alpha(image):
         rgba = image.convert("RGBA")
-        background = image_module.new("RGBA", rgba.size, (255, 255, 255, 255))
+        backdrop = image_module.new("RGBA", rgba.size, (*background, 255))
         try:
-            return image_module.alpha_composite(background, rgba).convert("RGB")
+            return image_module.alpha_composite(backdrop, rgba).convert("RGB")
         finally:
             rgba.close()
-            background.close()
+            backdrop.close()
     return image.convert("RGB")
 
 
-def _comparison_sample(image: Any, image_module: Any) -> Any:
-    flattened = _flatten_for_comparison(image, image_module)
+def _comparison_sample(
+    image: Any,
+    image_module: Any,
+    background: tuple[int, int, int] = WHITE,
+) -> Any:
+    flattened = _flatten_for_comparison(image, image_module, background)
     try:
         return flattened.resize(COMPARISON_SAMPLE_SIZE, image_module.Resampling.LANCZOS)
     finally:
         flattened.close()
+
+
+def _color_channel_sample(image: Any, image_module: Any) -> Any:
+    """Sample only the stored colour of a soft-masked PDF image, ignoring alpha."""
+    color = image.convert("RGB")
+    try:
+        return color.resize(COMPARISON_SAMPLE_SIZE, image_module.Resampling.LANCZOS)
+    finally:
+        color.close()
+
+
+def _image_matte(image_object: Any) -> tuple[int, int, int] | None:
+    """Return the RGB /Matte colour a soft-masked PDF image was pre-blended with.
+
+    Word exports semi-transparent pictures this way. pypdf decodes the colour
+    channels as stored, so they only resemble the source after the source is
+    composited onto the same matte colour.
+    """
+    try:
+        soft_mask = image_object.get("/SMask")
+        if soft_mask is None:
+            return None
+        matte = soft_mask.get_object().get("/Matte")
+        if matte is None:
+            return None
+        values = [
+            min(255, max(0, round(float(value) * 255)))
+            for value in matte.get_object()
+        ]
+    except Exception:
+        return None
+    if len(values) == 1:
+        return values[0], values[0], values[0]
+    if len(values) == 3:
+        return values[0], values[1], values[2]
+    return None
+
+
+def _drawingml_percentage(value: str | None) -> int:
+    if not value:
+        return 0
+    text = value.strip()
+    if text.endswith("%"):
+        return round(float(text[:-1]) * 1000)
+    return int(text)
+
+
+def _docx_picture_crops(archive: ZipFile) -> dict[str, set[tuple[int, int, int, int]]]:
+    """Map media parts to the a:srcRect crops of the pictures that display them.
+
+    Crop discovery is best effort: an unreadable part only means its pictures are
+    matched as whole images, exactly as before crop support existed.
+    """
+    names = set(archive.namelist())
+    crops: dict[str, set[tuple[int, int, int, int]]] = {}
+    for part in sorted(names):
+        if not part.startswith("word/") or not part.endswith(".xml") or "/_rels/" in part:
+            continue
+        folder, base = posixpath.split(part)
+        rels_name = f"{folder}/_rels/{base}.rels"
+        if rels_name not in names:
+            continue
+        try:
+            raw = archive.read(part)
+            if b"srcRect" not in raw:
+                continue
+            targets: dict[str, str] = {}
+            for relationship in ElementTree.fromstring(archive.read(rels_name)):
+                if relationship.tag != f"{{{_PACKAGE_RELATIONSHIPS_NS}}}Relationship":
+                    continue
+                if relationship.get("TargetMode") == "External":
+                    continue
+                rel_id = relationship.get("Id")
+                target = relationship.get("Target")
+                if not rel_id or not target:
+                    continue
+                if target.startswith("/"):
+                    targets[rel_id] = posixpath.normpath(target.lstrip("/"))
+                else:
+                    targets[rel_id] = posixpath.normpath(posixpath.join(folder, target))
+            root = ElementTree.fromstring(raw)
+        except Exception:
+            continue
+        for blip_fill in root.iter():
+            if not isinstance(blip_fill.tag, str) or not blip_fill.tag.endswith("}blipFill"):
+                continue
+            blip = blip_fill.find(f"{{{_DRAWINGML_NS}}}blip")
+            source_rect = blip_fill.find(f"{{{_DRAWINGML_NS}}}srcRect")
+            if blip is None or source_rect is None:
+                continue
+            media = targets.get(blip.get(f"{{{_OFFICE_RELATIONSHIPS_NS}}}embed", ""))
+            if media is None:
+                continue
+            try:
+                rect = tuple(
+                    _drawingml_percentage(source_rect.get(side))
+                    for side in ("l", "t", "r", "b")
+                )
+            except (ValueError, OverflowError):
+                continue
+            if any(rect):
+                crops.setdefault(media, set()).add(rect)
+    return crops
+
+
+def _crop_box(
+    size: tuple[int, int],
+    rect: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    """Convert DrawingML crop edges into a Pillow box, or None for no real crop."""
+    width, height = size
+    # Negative edges pad the picture frame; they do not remove source pixels.
+    left_edge, top_edge, right_edge, bottom_edge = (max(0, value) for value in rect)
+    left = round(width * left_edge / _DRAWINGML_FULL_EXTENT)
+    top = round(height * top_edge / _DRAWINGML_FULL_EXTENT)
+    right = round(width * (_DRAWINGML_FULL_EXTENT - right_edge) / _DRAWINGML_FULL_EXTENT)
+    bottom = round(height * (_DRAWINGML_FULL_EXTENT - bottom_edge) / _DRAWINGML_FULL_EXTENT)
+    if right - left < 1 or bottom - top < 1:
+        return None
+    box = (left, top, right, bottom)
+    return None if box == (0, 0, width, height) else box
+
+
+def _candidate_pixels(candidate: _DocxImage) -> Any:
+    """Return the source pixels Word placed: the crop region for cropped pictures."""
+    if candidate.crop_box is None:
+        return candidate.image
+    return candidate.image.crop(candidate.crop_box)
+
+
+def _docx_candidate(
+    name: str,
+    image: Any,
+    crop_box: tuple[int, int, int, int] | None,
+    image_module: Any,
+) -> _DocxImage | None:
+    region = image.crop(crop_box) if crop_box else image
+    flattened = None
+    try:
+        flattened = _flatten_for_comparison(region, image_module)
+        digest = hashlib.sha256(
+            f"{flattened.width}x{flattened.height}:".encode("ascii")
+            + flattened.tobytes()
+        ).hexdigest()
+        comparison_sample = flattened.resize(
+            COMPARISON_SAMPLE_SIZE,
+            image_module.Resampling.LANCZOS,
+        )
+    except Exception:
+        return None
+    finally:
+        if flattened is not None:
+            flattened.close()
+        if region is not image:
+            region.close()
+    return _DocxImage(
+        name=name,
+        image=image,
+        digest=digest,
+        comparison_sample=comparison_sample,
+        crop_box=crop_box,
+    )
+
+
+def _matte_sample(
+    candidate: _DocxImage,
+    matte: tuple[int, int, int],
+    image_module: Any,
+) -> Any:
+    if not _has_alpha(candidate.image):
+        return candidate.comparison_sample
+    sample = candidate.matte_samples.get(matte)
+    if sample is None:
+        pixels = _candidate_pixels(candidate)
+        try:
+            sample = _comparison_sample(pixels, image_module, background=matte)
+        finally:
+            if pixels is not candidate.image:
+                pixels.close()
+        candidate.matte_samples[matte] = sample
+    return sample
+
+
+def _close_candidates(candidates: list[_DocxImage]) -> None:
+    closed_images: set[int] = set()
+    for candidate in candidates:
+        # Crop candidates share the decoded media image with the whole-image one.
+        if id(candidate.image) not in closed_images:
+            closed_images.add(id(candidate.image))
+            candidate.image.close()
+        candidate.comparison_sample.close()
+        for sample in candidate.matte_samples.values():
+            sample.close()
+        candidate.matte_samples.clear()
 
 
 def _sample_similarity(
@@ -411,6 +654,7 @@ def _load_docx_images(
     source_path: Path,
     *,
     language: str = DEFAULT_LANGUAGE,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> list[_DocxImage]:
     try:
         from PIL import Image, ImageOps
@@ -420,12 +664,16 @@ def _load_docx_images(
     candidates: list[_DocxImage] = []
     try:
         with ZipFile(source_path) as archive:
+            crops = _docx_picture_crops(archive)
             media_names = sorted(
                 name
                 for name in archive.namelist()
                 if name.lower().startswith("word/media/") and not name.endswith("/")
             )
             for name in media_names:
+                if cancel_requested and cancel_requested():
+                    _close_candidates(candidates)
+                    raise ConversionCancelled()
                 try:
                     with Image.open(BytesIO(archive.read(name))) as opened:
                         image = ImageOps.exif_transpose(opened).copy()
@@ -437,35 +685,19 @@ def _load_docx_images(
                 if image.mode in {"I", "F", "I;16", "I;16B", "I;16L"}:
                     image.close()
                     continue
-                flattened = None
-                comparison_sample = None
-                try:
-                    flattened = _flatten_for_comparison(image, Image)
-                    digest = hashlib.sha256(
-                        f"{flattened.width}x{flattened.height}:".encode("ascii")
-                        + flattened.tobytes()
-                    ).hexdigest()
-                    comparison_sample = flattened.resize(
-                        COMPARISON_SAMPLE_SIZE,
-                        Image.Resampling.LANCZOS,
-                    )
-                except Exception:
-                    if comparison_sample is not None:
-                        comparison_sample.close()
+                whole = _docx_candidate(name, image, None, Image)
+                if whole is None:
                     image.close()
                     continue
-                finally:
-                    if flattened is not None:
-                        flattened.close()
-                candidates.append(
-                    _DocxImage(
-                        name=name,
-                        image=image,
-                        digest=digest,
-                        comparison_sample=comparison_sample,
-                    )
-                )
+                candidates.append(whole)
+                boxes = {_crop_box(image.size, rect) for rect in crops.get(name, ())}
+                boxes.discard(None)
+                for box in sorted(boxes):
+                    cropped = _docx_candidate(name, image, box, Image)
+                    if cropped is not None:
+                        candidates.append(cropped)
     except (BadZipFile, KeyError, OSError):
+        _close_candidates(candidates)
         return []
     return candidates
 
@@ -508,6 +740,7 @@ def _best_source_image(
     exported_image: Any,
     candidates: list[_DocxImage],
     *,
+    matte: tuple[int, int, int] | None = None,
     language: str = DEFAULT_LANGUAGE,
 ) -> _DocxImage | None:
     try:
@@ -519,13 +752,18 @@ def _best_source_image(
         return None
     exported_ratio = exported_image.width / exported_image.height
     exported_sample = _comparison_sample(exported_image, Image)
+    # A /Matte image stores colour already blended with the matte. Compare those
+    # channels with the source composited onto the same matte; keep the plain
+    # comparison too, in case a decoder un-premultiplies the colour itself.
+    color_sample = _color_channel_sample(exported_image, Image) if matte else None
     best_score = -1.0
     second_score = -1.0
     best_candidate: _DocxImage | None = None
     second_candidate: _DocxImage | None = None
     try:
         for candidate in candidates:
-            candidate_ratio = candidate.image.width / candidate.image.height
+            width, height = candidate.size
+            candidate_ratio = width / height
             if abs(candidate_ratio - exported_ratio) / max(
                 candidate_ratio,
                 exported_ratio,
@@ -537,6 +775,16 @@ def _best_source_image(
                 ImageChops,
                 ImageStat,
             )
+            if matte and color_sample is not None:
+                score = max(
+                    score,
+                    _sample_similarity(
+                        _matte_sample(candidate, matte, Image),
+                        color_sample,
+                        ImageChops,
+                        ImageStat,
+                    ),
+                )
             if score > best_score:
                 second_score = best_score
                 second_candidate = best_candidate
@@ -547,6 +795,8 @@ def _best_source_image(
                 second_candidate = candidate
     finally:
         exported_sample.close()
+        if color_sample is not None:
+            color_sample.close()
 
     if best_candidate is None or best_score < IMAGE_MATCH_THRESHOLD:
         return None
@@ -622,20 +872,28 @@ def restore_original_images(
     exported_pdf: str | Path,
     *,
     language: str = DEFAULT_LANGUAGE,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> ImageRestorationReport:
-    """Restore high-confidence DOCX source pixels without changing PDF page geometry."""
+    """Restore high-confidence DOCX source pixels without changing PDF page geometry.
+
+    `cancel_requested` is polled between images and before the restored PDF
+    replaces `exported_pdf`. On cancel, ConversionCancelled is raised and
+    `exported_pdf` is left as Word wrote it.
+    """
     source_path = validate_source(source_docx, language=language)
     pdf_path = Path(exported_pdf).expanduser().resolve()
-    candidates = _load_docx_images(source_path, language=language)
+    candidates = _load_docx_images(
+        source_path,
+        language=language,
+        cancel_requested=cancel_requested,
+    )
     if not candidates:
         return ImageRestorationReport(0, 0, 0)
 
     try:
         from pypdf import PdfWriter
     except ImportError as exc:
-        for candidate in candidates:
-            candidate.image.close()
-            candidate.comparison_sample.close()
+        _close_candidates(candidates)
         raise ConversionError(tr(language, "pypdf_restore_required")) from exc
 
     writer = None
@@ -647,6 +905,8 @@ def restore_original_images(
         writer = PdfWriter(clone_from=str(pdf_path))
         for page in writer.pages:
             for exported in page.images:
+                if cancel_requested and cancel_requested():
+                    raise ConversionCancelled()
                 reference = exported.indirect_reference
                 if reference is None:
                     continue
@@ -658,15 +918,23 @@ def restore_original_images(
                 match = _best_source_image(
                     exported.image,
                     candidates,
+                    matte=_image_matte(reference.get_object()),
                     language=language,
                 )
                 if match is None:
                     continue
-                replacement = _flate_image_object(match.image, writer)
+                pixels = _candidate_pixels(match)
+                try:
+                    replacement = _flate_image_object(pixels, writer)
+                finally:
+                    if pixels is not match.image:
+                        pixels.close()
                 replacement.indirect_reference = reference
                 writer._objects[reference.idnum - 1] = replacement
                 images_restored += 1
 
+        if cancel_requested and cancel_requested():
+            raise ConversionCancelled()
         if images_restored:
             with stage.open("wb") as stream:
                 writer.write(stream)
@@ -675,6 +943,8 @@ def restore_original_images(
                 close()
             writer = None
             _check_pdf(stage, language=language)
+            if cancel_requested and cancel_requested():
+                raise ConversionCancelled()
             _replace_with_retry(stage, pdf_path)
     except ConversionError:
         raise
@@ -686,15 +956,59 @@ def restore_original_images(
             close = getattr(writer, "close", None)
             if close:
                 close()
-        for candidate in candidates:
-            candidate.image.close()
-            candidate.comparison_sample.close()
+        _close_candidates(candidates)
 
     return ImageRestorationReport(
         images_examined=images_examined,
         images_restored=images_restored,
         images_unmatched=max(0, images_examined - images_restored),
     )
+
+
+def _open_word_process(word: Any) -> Any:
+    """Open a terminate handle to the WINWORD.EXE behind a DispatchEx instance.
+
+    A temporary unique caption identifies this instance's hidden main window even
+    when other lanes start Word at the same moment. Holding the handle pins the
+    process identity, so a later abort can never hit a reused process id.
+    Returns None when the process cannot be identified.
+    """
+    try:
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+    except ImportError:
+        return None
+    try:
+        previous_caption = word.Caption
+    except Exception:
+        return None
+    marker = f"DocxPDF-{uuid.uuid4().hex}"
+    try:
+        word.Caption = marker
+        window = win32gui.FindWindow("OpusApp", marker)
+        if not window:
+            return None
+        _thread_id, process_id = win32process.GetWindowThreadProcessId(window)
+        return win32api.OpenProcess(
+            win32con.PROCESS_TERMINATE | win32con.SYNCHRONIZE,
+            False,
+            process_id,
+        )
+    except Exception:
+        return None
+    finally:
+        try:
+            word.Caption = previous_caption
+        except Exception:
+            pass
+
+
+def _terminate_process(handle: Any) -> None:
+    import win32api
+
+    win32api.TerminateProcess(handle, 1)
 
 
 class WordSession:
@@ -706,6 +1020,11 @@ class WordSession:
         self._word: Any = None
         self._previous_security: Any = None
         self._com_initialized = False
+        self._process_handle: Any = None
+        # Guards the process handle and watchdog state shared with timer threads.
+        self._process_lock = threading.Lock()
+        self._watchdog_armed = False
+        self._timed_out = False
 
     def __enter__(self) -> WordSession:
         self.start()
@@ -726,6 +1045,7 @@ class WordSession:
             pythoncom.CoInitialize()
             self._com_initialized = True
             self._word = win32_client.DispatchEx("Word.Application")
+            self._process_handle = _open_word_process(self._word)
             self._word.Visible = False
             self._word.DisplayAlerts = WD_ALERTS_NONE
             try:
@@ -771,6 +1091,15 @@ class WordSession:
             except Exception:
                 pass
 
+        with self._process_lock:
+            handle = self._process_handle
+            self._process_handle = None
+            self._watchdog_armed = False
+        if handle is not None:
+            try:
+                handle.Close()
+            except Exception:
+                pass
         self._previous_security = None
         gc.collect()
         if self._com_initialized and self._pythoncom is not None:
@@ -781,6 +1110,52 @@ class WordSession:
         self._com_initialized = False
         self._pythoncom = None
 
+    def abort(self) -> bool:
+        """Terminate this session's own WINWORD.EXE; safe to call from any thread.
+
+        A COM call blocked by a hidden Word dialog never returns on its own.
+        Ending the process makes that call fail so the lane can recover.
+        """
+        with self._process_lock:
+            handle = self._process_handle
+            if handle is None:
+                return False
+            try:
+                _terminate_process(handle)
+            except Exception:
+                return False
+        return True
+
+    def _arm_watchdog(self, seconds: float) -> threading.Timer | None:
+        with self._process_lock:
+            self._timed_out = False
+            if self._process_handle is None:
+                return None
+            self._watchdog_armed = True
+        timer = threading.Timer(seconds, self._watchdog_expired)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def _watchdog_expired(self) -> None:
+        with self._process_lock:
+            if not self._watchdog_armed:
+                return
+            self._watchdog_armed = False
+            self._timed_out = True
+        self.abort()
+
+    def _disarm_watchdog(self, timer: threading.Timer | None) -> None:
+        with self._process_lock:
+            self._watchdog_armed = False
+        if timer is not None:
+            timer.cancel()
+
+    def _timeout_error(self, seconds: float) -> ConversionError:
+        return ConversionError(
+            tr(self.language, "word_timed_out", seconds=round(seconds))
+        )
+
     def convert_docx(
         self,
         source: str | Path,
@@ -788,7 +1163,15 @@ class WordSession:
         *,
         overwrite: bool = False,
         timeout: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> ConversionResult:
+        """Export one DOCX with this session's Word, then restore its images.
+
+        `cancel_requested` is polled after Word's export: between images during
+        restoration and before publishing. Word's export itself is not
+        interrupted. On cancel the exported PDF is deleted, nothing is published
+        and ConversionCancelled is raised.
+        """
         if self._word is None or self._pythoncom is None:
             raise ConversionError(
                 tr(self.language, "session_not_started"),
@@ -812,6 +1195,10 @@ class WordSession:
         temporary_output = output_path.with_name(f"DocxPDF-{uuid.uuid4().hex}.pdf")
         started = time.monotonic()
         document: Any = None
+        # `timeout` also bounds Word's open + export: a hidden dialog would
+        # otherwise block this lane, and with it cancel and close, forever.
+        word_timeout = DEFAULT_WORD_TIMEOUT if timeout is None else max(float(timeout), 1.0)
+        watchdog = self._arm_watchdog(word_timeout)
         try:
             missing = self._pythoncom.Missing
             document = self._word.Documents.Open(
@@ -873,16 +1260,22 @@ class WordSession:
                     abort_batch=True,
                 )
             size = _check_pdf(temporary_output, language=self.language)
-        except ConversionError:
+        except ConversionError as exc:
             temporary_output.unlink(missing_ok=True)
+            if self._timed_out:
+                raise self._timeout_error(word_timeout) from exc
             raise
         except OSError as exc:
             temporary_output.unlink(missing_ok=True)
+            if self._timed_out:
+                raise self._timeout_error(word_timeout) from exc
             raise ConversionError(
                 tr(self.language, "output_write_failed", error=exc)
             ) from exc
         except Exception as exc:
             temporary_output.unlink(missing_ok=True)
+            if self._timed_out:
+                raise self._timeout_error(word_timeout) from exc
             raise _friendly_com_error(exc, language=self.language) from exc
         finally:
             if document is not None:
@@ -892,6 +1285,12 @@ class WordSession:
                     pass
                 document = None
                 gc.collect()
+            self._disarm_watchdog(watchdog)
+        if self._timed_out:
+            # The export returned just as the watchdog ended Word. The PDF may be
+            # fine, but this session is gone; report it so the lane restarts Word.
+            temporary_output.unlink(missing_ok=True)
+            raise self._timeout_error(word_timeout)
 
         quality_report = ImageRestorationReport(0, 0, 0)
         try:
@@ -899,8 +1298,11 @@ class WordSession:
                 source_path,
                 temporary_output,
                 language=self.language,
+                cancel_requested=cancel_requested,
             )
             size = _check_pdf(temporary_output, language=self.language)
+            if cancel_requested and cancel_requested():
+                raise ConversionCancelled()
             output_path, output_relocated = _publish_pdf(
                 temporary_output, output_path, language=self.language
             )
@@ -931,6 +1333,7 @@ def convert_docx(
     overwrite: bool = False,
     timeout: float | None = None,
     language: str = DEFAULT_LANGUAGE,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> ConversionResult:
     """Export one DOCX through an isolated Word instance without modifying it."""
     with WordSession(language=language) as session:
@@ -939,6 +1342,7 @@ def convert_docx(
             output,
             overwrite=overwrite,
             timeout=timeout,
+            cancel_requested=cancel_requested,
         )
 
 

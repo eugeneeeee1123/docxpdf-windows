@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import app
 from PyQt6.QtWidgets import QApplication, QBoxLayout
-from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtCore import QEventLoop, Qt, QTimer
 from converter import ConversionResult, MergeResult
 
 
@@ -190,6 +191,289 @@ class AppTests(unittest.TestCase):
             session.convert_docx.assert_not_called()
             self.assertTrue(finished_payloads[-1][3])
 
+    @staticmethod
+    def _stuck_word_session(started: threading.Event | None = None) -> MagicMock:
+        """A session whose export hangs, like Word on a hidden dialog.
+
+        The export only fails once abort() ends the (fake) Word process.
+        """
+        aborted = threading.Event()
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.__exit__.return_value = None
+        session.aborted_at = None
+
+        def abort():
+            session.aborted_at = time.monotonic()
+            aborted.set()
+            return True
+
+        def stuck_export(_source, _output, **_kwargs):
+            if started is not None:
+                started.set()
+            if not aborted.wait(10):
+                raise AssertionError("the stuck export was never aborted")
+            raise app.ConversionError("The RPC server is unavailable.", abort_batch=True)
+
+        session.abort.side_effect = abort
+        session.convert_docx.side_effect = stuck_export
+        return session
+
+    @staticmethod
+    def _restoring_word_session(started: threading.Event) -> MagicMock:
+        """A session whose Word export is done and whose image restoration is slow.
+
+        Like converter.restore_original_images, restoration polls
+        cancel_requested between images and stops with ConversionCancelled.
+        """
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.__exit__.return_value = None
+        session.cancel_seen_at = None
+
+        def restoring_export(_source, _output, *, cancel_requested=None, **_kwargs):
+            started.set()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if cancel_requested is not None and cancel_requested():
+                    session.cancel_seen_at = time.monotonic()
+                    raise app.ConversionCancelled()
+                time.sleep(0.01)
+            raise AssertionError("image restoration never saw the cancel request")
+
+        session.convert_docx.side_effect = restoring_export
+        return session
+
+    def _close_choosing_stop_remaining(self, window: app.MainWindow) -> tuple[float, float]:
+        """Close a running window, choose "Stop remaining files" and wait for the job.
+
+        Returns when the close was requested and when the job thread finished.
+        """
+        dialog = MagicMock()
+        buttons = []
+        dialog.addButton.side_effect = lambda *_args: buttons.append(MagicMock()) or buttons[-1]
+        # The first button added is "Stop remaining files".
+        dialog.clickedButton.side_effect = lambda: buttons[0]
+        loop = QEventLoop()
+        guard = QTimer()
+        guard.setSingleShot(True)
+        guard.timeout.connect(loop.quit)
+        window.thread.finished.connect(loop.quit)
+        with patch.object(app, "QMessageBox", return_value=dialog) as message_box, patch.object(window, "_show_warning") as warning, patch.object(window, "close") as deferred_close:
+            closing_at = time.monotonic()
+            app.MainWindow.close(window)
+            self.assertTrue(window.close_after_cancel)
+            guard.start(5000)
+            loop.exec()
+            finished_at = time.monotonic()
+            guard.stop()
+            QApplication.processEvents()
+
+            self.assertEqual(message_box.call_count, 1)
+            warning.assert_not_called()
+            deferred_close.assert_called_once()
+        self.assertFalse(window.running)
+        self.assertFalse(window.close_after_cancel)
+        return closing_at, finished_at
+
+    def test_cancel_ends_stuck_word_export_after_grace_period(self) -> None:
+        grace = 0.4
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sources = [folder / "stuck.docx", folder / "next.docx"]
+            started = threading.Event()
+            session = self._stuck_word_session(started)
+            worker = app.ConversionWorker(sources, folder, False, False, parallel_workers=1)
+            finished_payloads = []
+            failed = []
+            worker.finished.connect(lambda *payload: finished_payloads.append(payload))
+            # Lanes emit from pool threads; a direct connection records it here.
+            worker.file_failed.connect(
+                lambda *payload: failed.append(payload),
+                type=Qt.ConnectionType.DirectConnection,
+            )
+            observed = {}
+
+            def cancel_once_exporting():
+                started.wait(5)
+                observed["cancelled_at"] = time.monotonic()
+                worker.request_cancel()
+                time.sleep(grace / 4)
+                observed["aborted_early"] = session.abort.called
+
+            canceller = threading.Thread(target=cancel_once_exporting)
+            with patch.object(app, "CANCEL_ABORT_GRACE_SECONDS", grace), patch.object(app, "WordSession", return_value=session):
+                canceller.start()
+                worker.run()
+                finished_at = time.monotonic()
+            canceller.join(5)
+
+            self.assertFalse(observed["aborted_early"])
+            session.abort.assert_called_once()
+            self.assertGreaterEqual(session.aborted_at - observed["cancelled_at"], grace * 0.9)
+            self.assertLess(finished_at - observed["cancelled_at"], grace + 2)
+            session.convert_docx.assert_called_once()
+            session.__exit__.assert_called_once()
+            results, errors, merged_result, cancelled = finished_payloads[-1]
+            self.assertEqual(results, [])
+            self.assertEqual(errors, [])
+            self.assertIsNone(merged_result)
+            self.assertTrue(cancelled)
+            self.assertEqual(failed, [])
+
+    def test_cancel_keeps_export_that_finishes_within_grace_period(self) -> None:
+        grace = 0.4
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sources = [folder / "slow.docx", folder / "next.docx"]
+            started = threading.Event()
+            release = threading.Event()
+            session = MagicMock()
+            session.__enter__.return_value = session
+            session.__exit__.return_value = None
+
+            def slow_export(source, output, **_kwargs):
+                started.set()
+                release.wait(5)
+                return ConversionResult(source.resolve(), Path(output), 10, 0.1)
+
+            session.convert_docx.side_effect = slow_export
+            worker = app.ConversionWorker(sources, folder, False, False, parallel_workers=1)
+            finished_payloads = []
+            worker.finished.connect(lambda *payload: finished_payloads.append(payload))
+
+            def cancel_then_finish_export():
+                started.wait(5)
+                worker.request_cancel()
+                time.sleep(grace / 4)
+                release.set()
+
+            canceller = threading.Thread(target=cancel_then_finish_export)
+            with patch.object(app, "CANCEL_ABORT_GRACE_SECONDS", grace), patch.object(app, "WordSession", return_value=session):
+                canceller.start()
+                worker.run()
+            canceller.join(5)
+
+            # Finishing the job cancels the grace timer before it can fire.
+            self.assertTrue(worker._cancel_timer.finished.is_set())
+            time.sleep(grace + 0.1)
+            session.abort.assert_not_called()
+            session.convert_docx.assert_called_once()
+            results, errors, _merged_result, cancelled = finished_payloads[-1]
+            self.assertEqual([result.source for result in results], [sources[0].resolve()])
+            self.assertEqual(errors, [])
+            self.assertTrue(cancelled)
+
+    def test_stop_remaining_on_close_ends_stuck_exports_as_cancelled(self) -> None:
+        grace = 0.3
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            docs = [folder / "one.docx", folder / "two.docx"]
+            for doc in docs:
+                doc.touch()
+            started = [threading.Event(), threading.Event()]
+            sessions = [self._stuck_word_session(event) for event in started]
+            settings = MagicMock()
+            settings.value.return_value = ""
+            with patch.object(app, "QSettings", return_value=settings), patch.object(app, "locate_word_app", return_value=None), patch.object(app, "CANCEL_ABORT_GRACE_SECONDS", grace), patch.object(app, "WordSession", side_effect=sessions), patch.dict(os.environ, {"DOCXPDF_WORD_WORKERS": "2"}):
+                window = app.MainWindow(language="en")
+                window.reveal_box.setChecked(False)
+                window.add_files(docs)
+                window.start_conversion()
+                for event in started:
+                    self.assertTrue(event.wait(5))
+
+                closing_at, finished_at = self._close_choosing_stop_remaining(window)
+                self.assertLess(finished_at - closing_at, grace + 2)
+                for session in sessions:
+                    session.abort.assert_called_once()
+                    self.assertGreaterEqual(session.aborted_at - closing_at, grace * 0.9)
+                self.assertEqual(
+                    [window.item_states[str(source)][0] for source in window.sources],
+                    ["cancelled", "cancelled"],
+                )
+                self.assertIn("Task cancelled; 0 file(s)", window.status_label.text())
+                window.close()
+
+    def test_cancel_interrupts_image_restoration_without_waiting_for_grace_period(self) -> None:
+        grace = 5
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sources = [folder / "heavy.docx", folder / "next.docx"]
+            started = threading.Event()
+            session = self._restoring_word_session(started)
+            worker = app.ConversionWorker(sources, folder, False, False, parallel_workers=1)
+            finished_payloads = []
+            failed = []
+            worker.finished.connect(lambda *payload: finished_payloads.append(payload))
+            worker.file_failed.connect(
+                lambda *payload: failed.append(payload),
+                type=Qt.ConnectionType.DirectConnection,
+            )
+            observed = {}
+
+            def cancel_during_restoration():
+                started.wait(5)
+                observed["cancelled_at"] = time.monotonic()
+                worker.request_cancel()
+
+            canceller = threading.Thread(target=cancel_during_restoration)
+            with patch.object(app, "CANCEL_ABORT_GRACE_SECONDS", grace), patch.object(app, "WordSession", return_value=session):
+                canceller.start()
+                worker.run()
+                finished_at = time.monotonic()
+            canceller.join(5)
+
+            # The lane passes the cancel event itself, so restoration stops at
+            # once rather than when the cancel timer would end Word.
+            self.assertEqual(
+                session.convert_docx.call_args.kwargs["cancel_requested"],
+                worker._cancel_event.is_set,
+            )
+            self.assertLess(finished_at - observed["cancelled_at"], 1)
+            self.assertTrue(worker._cancel_timer.finished.is_set())
+            session.abort.assert_not_called()
+            session.convert_docx.assert_called_once()
+            session.__exit__.assert_called_once()
+            results, errors, merged_result, cancelled = finished_payloads[-1]
+            self.assertEqual(results, [])
+            self.assertEqual(errors, [])
+            self.assertIsNone(merged_result)
+            self.assertTrue(cancelled)
+            self.assertEqual(failed, [])
+
+    def test_stop_remaining_on_close_interrupts_image_restoration(self) -> None:
+        grace = 5
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            docs = [folder / "one.docx", folder / "two.docx"]
+            for doc in docs:
+                doc.touch()
+            started = [threading.Event(), threading.Event()]
+            sessions = [self._restoring_word_session(event) for event in started]
+            settings = MagicMock()
+            settings.value.return_value = ""
+            with patch.object(app, "QSettings", return_value=settings), patch.object(app, "locate_word_app", return_value=None), patch.object(app, "CANCEL_ABORT_GRACE_SECONDS", grace), patch.object(app, "WordSession", side_effect=sessions), patch.dict(os.environ, {"DOCXPDF_WORD_WORKERS": "2"}):
+                window = app.MainWindow(language="en")
+                window.reveal_box.setChecked(False)
+                window.add_files(docs)
+                window.start_conversion()
+                for event in started:
+                    self.assertTrue(event.wait(5))
+
+                closing_at, finished_at = self._close_choosing_stop_remaining(window)
+                self.assertLess(finished_at - closing_at, 2)
+                for session in sessions:
+                    self.assertIsNotNone(session.cancel_seen_at)
+                    session.abort.assert_not_called()
+                    session.__exit__.assert_called_once()
+                self.assertEqual(
+                    [window.item_states[str(source)][0] for source in window.sources],
+                    ["cancelled", "cancelled"],
+                )
+                self.assertIn("Task cancelled; 0 file(s)", window.status_label.text())
+                window.close()
+
     def test_nonfatal_word_failure_restarts_session_before_next_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -347,6 +631,64 @@ class AppTests(unittest.TestCase):
                     self.assertEqual(window.output_button.text(), "Browse…")
                     self.assertIn("Current folder:", window.output_path_preview.text())
                     settings.setValue.assert_called_with("ui/language", "en")
+                    window.close()
+
+    def test_images_left_at_word_quality_are_reported_in_both_languages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sources = [folder / "one.docx", folder / "two.docx", folder / "three.docx"]
+            for source in sources:
+                source.touch()
+            results = [
+                ConversionResult(
+                    source.resolve(),
+                    folder / f"{source.stem}.pdf",
+                    1024,
+                    0.1,
+                    images_restored=restored,
+                    images_examined=examined,
+                )
+                for source, (restored, examined) in zip(sources, ((2, 3), (0, 1), (4, 4)))
+            ]
+            settings = MagicMock()
+            settings.value.return_value = ""
+
+            with patch.object(app, "QSettings", return_value=settings):
+                with patch.object(app, "locate_word_app", return_value=None):
+                    window = app.MainWindow(language="zh")
+                    window.add_files(sources)
+                    window.on_file_succeeded(results[0], 1, 3)
+                    self.assertIn("原图保真 2 张", window.file_list.item(0).text())
+                    self.assertIn("1 张图片未能还原（仍为 Word 版本）", window.file_list.item(0).text())
+                    self.assertIn("1 张图片未能还原（仍为 Word 版本）", window.status_label.text())
+                    window.on_file_succeeded(results[1], 2, 3)
+                    self.assertIn("1 张图片未能还原（仍为 Word 版本）", window.file_list.item(1).text())
+                    window.on_file_succeeded(results[2], 3, 3)
+                    self.assertNotIn("未能还原", window.file_list.item(2).text())
+                    self.assertNotIn("未能还原", window.status_label.text())
+
+                    window.on_conversion_finished(results, [], None, False)
+                    self.assertEqual(
+                        window.status_label.text(),
+                        "全部完成：已生成 3 个 PDF，原图保真 6 张；2 张图片未能还原（仍为 Word 版本）。",
+                    )
+
+                    window.language_combo.setCurrentIndex(window.language_combo.findData("en"))
+                    self.assertEqual(
+                        window.status_label.text(),
+                        "All done: created 3 PDF file(s), with 6 original image(s) restored; "
+                        "2 image(s) could not be restored (still Word's version).",
+                    )
+                    self.assertIn(
+                        "Done · 2 original image(s) restored · 1 image(s) could not be restored "
+                        "(still Word's version)",
+                        window.file_list.item(0).text(),
+                    )
+                    self.assertIn(
+                        "Done · 1 image(s) could not be restored (still Word's version)",
+                        window.file_list.item(1).text(),
+                    )
+                    self.assertNotIn("could not be restored", window.file_list.item(2).text())
                     window.close()
 
     def test_theme_switch_persists_and_layout_adapts_to_narrow_window(self) -> None:

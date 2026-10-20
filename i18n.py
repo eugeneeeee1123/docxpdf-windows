@@ -144,6 +144,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "zh": "，原图保真 {count} 张",
         "en": ", with {count} original image(s) restored",
     },
+    "unrestored_note": {
+        "zh": " · {count} 张图片未能还原（仍为 Word 版本）",
+        "en": " · {count} image(s) could not be restored (still Word's version)",
+    },
+    "unrestored_note_comma": {
+        "zh": "；{count} 张图片未能还原（仍为 Word 版本）",
+        "en": "; {count} image(s) could not be restored (still Word's version)",
+    },
     # Status messages and dialogs.
     "select_files": {"zh": "请选择 DOCX 文件。", "en": "Choose one or more DOCX files."},
     "files_added": {
@@ -280,6 +288,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "pillow_restore_required": {"zh": "原图保真处理需要 Pillow。", "en": "Original-image restoration requires Pillow."},
     "pypdf_restore_required": {"zh": "原图保真处理需要 pypdf。", "en": "Original-image restoration requires pypdf."},
     "restore_failed": {"zh": "原图保真处理失败：{error}", "en": "Original-image restoration failed: {error}"},
+    "word_timed_out": {
+        "zh": "Word 在 {seconds} 秒内未完成导出，可能被隐藏的对话框卡住；已结束这个 Word 进程。",
+        "en": "Word did not finish the export within {seconds} seconds and may be stuck on a hidden dialog; that Word process was closed.",
+    },
     "windows_only": {"zh": "当前版本只支持 Windows。", "en": "This version supports Windows only."},
     "session_not_started": {
         "zh": "Microsoft Word 转换会话尚未启动。",
